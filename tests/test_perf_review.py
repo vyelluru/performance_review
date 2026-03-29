@@ -96,14 +96,32 @@ class PerfReviewTests(unittest.TestCase):
                             "customfield_10016": 3,
                             "comment": {"comments": []},
                         },
-                    }
+                    },
+                    {
+                        "key": "ABC-457",
+                        "fields": {
+                            "summary": "Harden retries",
+                            "description": {"content": [{"text": "Added guardrails"}]},
+                            "updated": "2026-03-09T10:00:00Z",
+                            "created": "2026-03-07T10:00:00Z",
+                            "status": {"name": "Done"},
+                            "priority": {"name": "Low"},
+                            "issuetype": {"name": "Task"},
+                            "assignee": {"displayName": "Engineer"},
+                            "reporter": {"displayName": "Lead"},
+                            "labels": ["stability"],
+                            "customfield_10016": 1,
+                            "comment": {"comments": []},
+                        },
+                    },
                 ],
-                "total": 1,
+                "total": 2,
             }
             with mock.patch("perf_review.connectors.jira.http_get_json", return_value=payload):
                 direct = live_connector.fetch("direct", sync_state={})
-            self.assertEqual(1, len([artifact for artifact in direct.artifacts if artifact.artifact_type == "issue"]))
-            direct_issue = next(artifact for artifact in direct.artifacts if artifact.artifact_type == "issue")
+            direct_issues = [artifact for artifact in direct.artifacts if artifact.artifact_type == "issue"]
+            self.assertEqual(2, len(direct_issues))
+            direct_issue = direct_issues[0]
             self.assertEqual("Engineer", direct_issue.metadata["assignee"])
             self.assertEqual("In Progress", direct_issue.metadata["status"])
             self.assertEqual("Medium", direct_issue.metadata["priority"])
@@ -136,6 +154,15 @@ class PerfReviewTests(unittest.TestCase):
                         "history": {"createdBy": {"displayName": "Engineer"}},
                         "metadata": {"labels": {"results": [{"name": "launch"}]}},
                         "_links": {"webui": "/wiki/spaces/ENG/pages/42"},
+                    },
+                    {
+                        "id": "43",
+                        "title": "Follow-up Plan",
+                        "body": {"storage": {"value": "<p>Ship supporting reliability work</p>"}},
+                        "version": {"when": "2026-03-03T10:00:00Z"},
+                        "history": {"createdBy": {"displayName": "Engineer"}},
+                        "metadata": {"labels": {"results": [{"name": "reliability"}]}},
+                        "_links": {"webui": "/wiki/spaces/ENG/pages/43"},
                     }
                 ],
                 "_links": {},
@@ -150,9 +177,10 @@ class PerfReviewTests(unittest.TestCase):
                     }
                 ]
             }
-            with mock.patch("perf_review.connectors.confluence.http_get_json", side_effect=[search_payload, comment_payload]):
+            empty_comment_payload = {"results": []}
+            with mock.patch("perf_review.connectors.confluence.http_get_json", side_effect=[search_payload, comment_payload, empty_comment_payload]):
                 direct = live_connector.fetch("direct", sync_state={})
-            self.assertEqual(2, len(direct.artifacts))
+            self.assertEqual(3, len(direct.artifacts))
 
     def test_document_import_is_chunked_by_sections(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:

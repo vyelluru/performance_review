@@ -51,7 +51,8 @@ class JiraConnector(BaseConnector):
         username = self.config.get("auth_username")
         headers = auth_headers(token, username=username)
         start_at = 0
-        newest_seen = sync_state.get("cursor")
+        latest_cursor = sync_state.get("cursor")
+        newest_seen = latest_cursor
         collected: list[dict[str, Any]] = []
         while True:
             jql = f"project={project} ORDER BY updated DESC"
@@ -75,7 +76,7 @@ class JiraConnector(BaseConnector):
             stop = False
             for issue in issues:
                 updated = ((issue.get("fields") or {}).get("updated"))
-                if newest_seen and updated and updated <= str(newest_seen):
+                if latest_cursor and updated and updated <= str(latest_cursor):
                     stop = True
                     break
                 if updated:

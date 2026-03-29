@@ -58,7 +58,8 @@ class ConfluenceConnector(BaseConnector):
         base_url = self.config["base_url"].rstrip("/")
         space = self.config["space"]
         headers = auth_headers(token, username=username)
-        newest_seen = sync_state.get("cursor")
+        latest_cursor = sync_state.get("cursor")
+        newest_seen = latest_cursor
         start = 0
         pages: list[dict[str, Any]] = []
         while True:
@@ -78,7 +79,7 @@ class ConfluenceConnector(BaseConnector):
             stop = False
             for page in results:
                 modified_at = ((page.get("version") or {}).get("when"))
-                if newest_seen and modified_at and modified_at <= str(newest_seen):
+                if latest_cursor and modified_at and modified_at <= str(latest_cursor):
                     stop = True
                     break
                 if modified_at:
