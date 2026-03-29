@@ -1,0 +1,66 @@
+{
+  "competencies": [
+    {
+      "description": "Deliver meaningful outcomes with visible customer or business value.",
+      "id": "impact",
+      "keywords": [
+        "launch",
+        "customer",
+        "metric",
+        "impact",
+        "improved",
+        "delivered"
+      ],
+      "title": "Impact"
+    },
+    {
+      "description": "Drive projects to completion with strong ownership and follow-through.",
+      "id": "execution",
+      "keywords": [
+        "implemented",
+        "fixed",
+        "shipped",
+        "closed",
+        "resolved",
+        "completed"
+      ],
+      "title": "Execution"
+    },
+    {
+      "description": "Work effectively across teams through communication and partnership.",
+      "id": "collaboration",
+      "keywords": [
+        "partnered",
+        "collaborated",
+        "cross-team",
+        "review",
+        "shared",
+        "aligned"
+      ],
+      "title": "Collaboration"
+    },
+    {
+      "description": "Shape direction, quality, and team effectiveness beyond individual execution.",
+      "id": "leadership",
+      "keywords": [
+        "mentored",
+        "led",
+        "designed",
+        "strategy",
+        "proposed",
+        "unblocked"
+      ],
+      "title": "Leadership"
+    }
+  ],
+  "prompts": {
+    "gap_summary": "Identify sparse competencies and unsupported claims.",
+    "self_review_intro": "Write a concise self-review grounded in the cited evidence."
+  },
+  "section_order": [
+    "impact",
+    "execution",
+    "collaboration",
+    "leadership"
+  ]
+}
