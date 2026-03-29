@@ -579,7 +579,8 @@ class Database:
     def fetch_task_memberships(self, task_id: int) -> list[sqlite3.Row]:
         return self.connection.execute(
             """
-            select tm.*, a.title, a.body_text, a.artifact_type, a.occurred_at, a.source_alias,
+            select tm.*, a.title, a.body_text, a.artifact_type, a.occurred_at, a.source_alias, a.author,
+                   a.metadata_json,
                    json_extract(a.metadata_json, '$.repo_name') as repo_name,
                    json_extract(a.metadata_json, '$.repo') as metadata_repo
             from task_memberships tm

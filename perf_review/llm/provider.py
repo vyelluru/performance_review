@@ -54,6 +54,37 @@ class BaseLLMProvider:
             lines.append("- Evidence coverage is balanced across configured competencies.")
         return "\n".join(lines)
 
+    def draft_portfolio_intro(self, subject_name: str, generated_on: str, total_projects: int, task_titles: list[str]) -> str:
+        if task_titles:
+            highlighted = ", ".join(task_titles[:3])
+            return (
+                f"Self assessment for {subject_name} - {generated_on}\n"
+                f"This review summarizes {total_projects} projects, with a focus on {highlighted}."
+            )
+        return f"Self assessment for {subject_name} - {generated_on}"
+
+    def draft_project_entry(self, project: dict[str, Any]) -> dict[str, Any]:
+        evidence = project.get("evidence", [])
+        summary = project.get("summary") or project["title"]
+        implementation_summary = project.get("implementation_summary") or summary
+        impact_summary = project.get("impact_summary") or "Impact is inferred from the available implementation evidence."
+        collaboration_summary = project.get("collaboration_summary") or "Collaboration signals were limited in the attached evidence."
+        doc_titles = [item["title"] for item in evidence if item.get("artifact_type") == "doc"]
+        code_titles = [item["title"] for item in evidence if item.get("artifact_type") in {"commit", "pr", "issue"}]
+        support_titles = [item["title"] for item in evidence if item.get("artifact_type") in {"comment", "review"}]
+        specific = _dedupe_preserve_order(code_titles + doc_titles + support_titles)[:5]
+        code_contributions = _dedupe_preserve_order(code_titles)[:4]
+        return {
+            "project_summary": summary,
+            "complexity_and_difficulty": project.get("complexity_reasoning") or "Complexity was inferred from the breadth of evidence attached to this task.",
+            "my_impact": impact_summary,
+            "specific_contributions": specific,
+            "technical_leadership": implementation_summary,
+            "design_docs": _dedupe_preserve_order(doc_titles)[:3],
+            "code_contributions": code_contributions,
+            "initiative_and_mentorship": collaboration_summary,
+        }
+
     def enrich_task(self, task_title: str, evidence: list[dict[str, Any]], source_anchor: str | None = None) -> dict[str, Any]:
         summaries = [self._artifact_summary(item) for item in evidence[:5]]
         summary = f"{task_title}: " + "; ".join(summaries[:2]) if summaries else task_title
@@ -136,6 +167,47 @@ class OllamaProvider(BaseLLMProvider):
             f"Missing competencies: {missing}. Weak tasks: {weak}."
         )
         return self._generate(prompt)
+
+    def draft_portfolio_intro(self, subject_name: str, generated_on: str, total_projects: int, task_titles: list[str]) -> str:
+        if not self.available():
+            return super().draft_portfolio_intro(subject_name, generated_on, total_projects, task_titles)
+        prompt = (
+            "Write a concise 2-3 sentence header for a software engineer self assessment. "
+            "Keep the exact first line format 'Self assessment for <name> - <date>'. "
+            "Then add one short summary sentence about the portfolio.\n"
+            f"Name: {subject_name}\n"
+            f"Date: {generated_on}\n"
+            f"Total projects: {total_projects}\n"
+            f"Project titles: {json.dumps(task_titles[:8])}"
+        )
+        return self._generate(prompt)
+
+    def draft_project_entry(self, project: dict[str, Any]) -> dict[str, Any]:
+        if not self.available():
+            return super().draft_project_entry(project)
+        prompt = (
+            "You are writing one project entry for a performance review self assessment. "
+            "Return strict JSON with keys project_summary, complexity_and_difficulty, my_impact, "
+            "specific_contributions, technical_leadership, design_docs, code_contributions, initiative_and_mentorship. "
+            "specific_contributions, design_docs, and code_contributions must be arrays of short strings. "
+            "Focus on concrete work and outcomes and avoid filler.\n"
+            f"Project: {json.dumps(project, indent=2)}"
+        )
+        raw = self._generate(prompt)
+        try:
+            parsed = json.loads(raw)
+            return {
+                "project_summary": str(parsed.get("project_summary", project["title"])),
+                "complexity_and_difficulty": str(parsed.get("complexity_and_difficulty", project.get("complexity_reasoning", ""))),
+                "my_impact": str(parsed.get("my_impact", project.get("impact_summary", ""))),
+                "specific_contributions": [str(item) for item in parsed.get("specific_contributions", [])][:6],
+                "technical_leadership": str(parsed.get("technical_leadership", project.get("implementation_summary", ""))),
+                "design_docs": [str(item) for item in parsed.get("design_docs", [])][:4],
+                "code_contributions": [str(item) for item in parsed.get("code_contributions", [])][:5],
+                "initiative_and_mentorship": str(parsed.get("initiative_and_mentorship", project.get("collaboration_summary", ""))),
+            }
+        except (ValueError, TypeError, json.JSONDecodeError):
+            return super().draft_project_entry(project)
 
     def enrich_task(self, task_title: str, evidence: list[dict[str, Any]], source_anchor: str | None = None) -> dict[str, Any]:
         if not self.available():
@@ -243,3 +315,15 @@ def _infer_complexity_reasoning(evidence: list[dict[str, Any]], source_anchor: s
         f"artifact types {', '.join(unique_types) or 'unknown'}, repos {', '.join(unique_repos) or 'none'}, "
         f"max story points {max_story_points:.0f}, anchored by {anchor_text}."
     )
+
+
+def _dedupe_preserve_order(items: list[str]) -> list[str]:
+    seen: set[str] = set()
+    result: list[str] = []
+    for item in items:
+        normalized = item.strip()
+        if not normalized or normalized in seen:
+            continue
+        seen.add(normalized)
+        result.append(normalized)
+    return result

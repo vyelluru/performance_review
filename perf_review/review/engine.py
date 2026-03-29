@@ -2,6 +2,8 @@ from __future__ import annotations
 
 import html
 import json
+from collections import Counter
+from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any
 
@@ -9,7 +11,7 @@ from perf_review.llm.provider import BaseLLMProvider
 from perf_review.models import ClaimRecord, ReviewRunArtifacts
 from perf_review.store.db import Database
 from perf_review.utils.text import summarize_text
-from perf_review.utils.time import TimeWindow
+from perf_review.utils.time import TimeWindow, parse_datetime
 
 
 def generate_review(database: Database, llm_provider: BaseLLMProvider, rubric: dict[str, Any], period: TimeWindow, rubric_path: str) -> tuple[int, ReviewRunArtifacts]:
@@ -26,9 +28,10 @@ def generate_review(database: Database, llm_provider: BaseLLMProvider, rubric: d
     ]
     section_order = rubric.get("section_order", [row["id"] for row in competencies])
     section_titles = {row["id"]: row["title"] for row in competencies}
-    sections: dict[str, list[str]] = {section_id: [] for section_id in section_order}
     claims: list[ClaimRecord] = []
     weak_tasks: list[str] = []
+    project_entries: list[dict[str, Any]] = []
+    all_evidence: list[dict[str, Any]] = []
 
     for task in task_rows:
         memberships = [dict(row) for row in database.fetch_task_memberships(task["id"])]
@@ -40,55 +43,70 @@ def generate_review(database: Database, llm_provider: BaseLLMProvider, rubric: d
                 "artifact_type": membership["artifact_type"],
                 "source_alias": membership["source_alias"],
                 "membership_score": membership["membership_score"],
+                "author": membership["author"],
+                "repo_name": membership["repo_name"] or membership["metadata_repo"],
+                **json.loads(membership["metadata_json"] or "{}"),
             }
             for membership in memberships
         ]
+        all_evidence.extend(evidence)
         if task["confidence"] < 0.7:
             weak_tasks.append(task["title"])
-        summary = task.get("summary") or llm_provider.summarize_task(task["title"], evidence)
-        implementation_summary = task.get("implementation_summary") or summary
-        impact_summary = task.get("impact_summary") or ""
-        collaboration_summary = task.get("collaboration_summary") or ""
+        project_payload = {
+            "title": task["title"],
+            "summary": task.get("summary") or llm_provider.summarize_task(task["title"], evidence),
+            "implementation_summary": task.get("implementation_summary") or task.get("summary") or task["title"],
+            "impact_summary": task.get("impact_summary") or "",
+            "collaboration_summary": task.get("collaboration_summary") or "",
+            "complexity_reasoning": task.get("complexity_reasoning") or "",
+            "complexity_score": task.get("complexity_score") or 0.0,
+            "status": task.get("status") or "inferred",
+            "repos": database.fetch_task_repo_names(task["id"]),
+            "timeframe": _format_timeframe(task.get("start_at"), task.get("end_at")),
+            "evidence": evidence[:8],
+        }
+        drafted_entry = llm_provider.draft_project_entry(project_payload)
+        citation = _citation_suffix(task["id"], [item["artifact_id"] for item in evidence[:5]])
+        claims.append(
+            ClaimRecord(
+                section_id=f"task:{task['id']}",
+                section_title=task["title"],
+                claim_text=(drafted_entry["my_impact"] or drafted_entry["project_summary"]).rstrip(".") + citation,
+                artifact_ids=[item["artifact_id"] for item in evidence[:5]],
+                task_ids=[task["id"]],
+            )
+        )
         classifier_text = " ".join(
-            part for part in [
-                summary,
-                implementation_summary,
-                impact_summary,
-                collaboration_summary,
+            part
+            for part in [
+                drafted_entry["project_summary"],
+                drafted_entry["technical_leadership"],
+                drafted_entry["my_impact"],
+                drafted_entry["initiative_and_mentorship"],
                 " ".join(item["body_text"] for item in evidence if item.get("body_text")),
-            ] if part
+            ]
+            if part
         )
         assigned = llm_provider.classify_competencies(classifier_text, competencies)
-        if not assigned:
-            assigned = [section_order[0]] if section_order else ["uncategorized"]
-        citation = _citation_suffix(task["id"], [item["artifact_id"] for item in evidence[:5]])
-        claim_core = impact_summary or implementation_summary or summary
-        claim_text = claim_core.rstrip(".") + citation
+        if not assigned and section_order:
+            assigned = [section_order[0]]
         for section_id in assigned[:2]:
-            sections.setdefault(section_id, []).append(claim_text)
-            claims.append(
-                ClaimRecord(
-                    section_id=section_id,
-                    section_title=section_titles.get(section_id, section_id.title()),
-                    claim_text=claim_text,
-                    artifact_ids=[item["artifact_id"] for item in evidence[:5]],
-                    task_ids=[task["id"]],
-                )
-            )
             competency_entity = database.insert_entity("competency", section_id, section_titles.get(section_id, section_id.title()), {})
             database.insert_edge("task", task["id"], "maps_to", "entity", competency_entity, confidence=0.8, metadata={"source": "review_generation"})
+        project_entries.append(
+            {
+                "task_id": task["id"],
+                "title": task["title"],
+                "timeframe": project_payload["timeframe"],
+                "repos": project_payload["repos"],
+                "draft": drafted_entry,
+                "citation": citation,
+            }
+        )
     database.commit()
 
-    missing = [section_titles.get(section_id, section_id.title()) for section_id in section_order if not sections.get(section_id)]
-    intro = f"# Self Review ({period.label})\n\n"
-    intro += "This draft is grounded in locally collected evidence and every bullet includes citations.\n\n"
-    body_parts: list[str] = [intro]
-    for section_id in section_order:
-        title = section_titles.get(section_id, section_id.title())
-        summaries = sections.get(section_id, [])
-        rendered = llm_provider.draft_section(title, summaries) if summaries else "- Evidence was sparse for this competency during the selected period."
-        body_parts.append(f"## {title}\n\n{rendered}\n")
-    self_review_markdown = "\n".join(body_parts).strip() + "\n"
+    missing = _missing_competencies(database, section_order, section_titles)
+    self_review_markdown = _render_self_assessment(period, llm_provider, project_entries, all_evidence)
 
     evidence_appendix_markdown = _render_evidence_appendix(task_rows, database)
     gaps_markdown = "# Evidence Gaps\n\n" + llm_provider.draft_gaps(missing, weak_tasks) + "\n"
@@ -174,6 +192,97 @@ def _render_evidence_appendix(task_rows: list[dict[str, Any]], database: Databas
 def _citation_suffix(task_id: int, artifact_ids: list[int]) -> str:
     joined = ", ".join(str(artifact_id) for artifact_id in artifact_ids)
     return f" [task:{task_id}; artifacts:{joined}]"
+
+
+def _render_self_assessment(period: TimeWindow, llm_provider: BaseLLMProvider, project_entries: list[dict[str, Any]], all_evidence: list[dict[str, Any]]) -> str:
+    generated_on = datetime.now(UTC).strftime("%Y-%b-%d")
+    subject_name = _infer_subject_name(all_evidence)
+    intro = llm_provider.draft_portfolio_intro(subject_name, generated_on, len(project_entries), [entry["title"] for entry in project_entries])
+    lines = [f"# {intro}", ""]
+    for entry in project_entries:
+        draft = entry["draft"]
+        lines.append(f"## {entry['title']}")
+        if entry["timeframe"]:
+            lines.append(f"Timeframe: {entry['timeframe']}")
+        if entry["repos"]:
+            lines.append(f"Repos involved: {', '.join(entry['repos'])}")
+        lines.append("")
+        lines.append(f"Project summary: {draft['project_summary']}{entry['citation']}")
+        lines.append("")
+        lines.append(f"Complexity & difficulty: {draft['complexity_and_difficulty']}")
+        lines.append("")
+        lines.append(f"My impact: {draft['my_impact']}")
+        lines.append("")
+        lines.append("My specific contributions:")
+        for item in draft["specific_contributions"] or ["Contribution details are inferred from the attached evidence."]:
+            lines.append(f"- {item}")
+        lines.append("")
+        lines.append("Technical leadership and code contributions:")
+        lines.append("")
+        lines.append(f"{draft['technical_leadership']}")
+        lines.append("")
+        lines.append("Design docs authored/reviewed:")
+        design_docs = draft["design_docs"] or ["No standalone design docs were attached to this task."]
+        for item in design_docs:
+            lines.append(f"- {item}")
+        lines.append("")
+        lines.append("Code & system contributions:")
+        code_items = draft["code_contributions"] or ["Code and system contributions are represented in the attached evidence."]
+        for item in code_items:
+            lines.append(f"- {item}")
+        lines.append("")
+        lines.append("Initiative & mentorship:")
+        lines.append("")
+        lines.append(f"{draft['initiative_and_mentorship']}")
+        lines.append("")
+    lines.append(f"Total number of projects combined: {len(project_entries)}")
+    return "\n".join(lines).strip() + "\n"
+
+
+def _infer_subject_name(evidence: list[dict[str, Any]]) -> str:
+    candidates: list[str] = []
+    for item in evidence:
+        for key in ("assignee", "author", "reporter"):
+            value = item.get(key)
+            if isinstance(value, str) and value.strip():
+                candidates.append(value.strip())
+    if not candidates:
+        return "Engineer"
+    return Counter(candidates).most_common(1)[0][0]
+
+
+def _format_timeframe(start_at: str | None, end_at: str | None) -> str:
+    start = parse_datetime(start_at)
+    end = parse_datetime(end_at)
+    if not start and not end:
+        return ""
+    if start and end:
+        return f"{start.strftime('%B %Y')} – {end.strftime('%B %Y')}"
+    value = start or end
+    if value is None:
+        return ""
+    return value.strftime("%B %Y")
+
+
+def _missing_competencies(database: Database, section_order: list[str], section_titles: dict[str, str]) -> list[str]:
+    missing: list[str] = []
+    for section_id in section_order:
+        row = database.connection.execute(
+            """
+            select 1
+            from edges rel
+            join entities e on e.id = rel.to_id
+            where rel.from_kind = 'task'
+              and rel.rel_type = 'maps_to'
+              and e.entity_type = 'competency'
+              and e.value = ?
+            limit 1
+            """,
+            (section_id,),
+        ).fetchone()
+        if row is None:
+            missing.append(section_titles.get(section_id, section_id.title()))
+    return missing
 
 
 def _render_html_report(period_label: str, self_review_markdown: str, evidence_appendix_markdown: str, gaps_markdown: str) -> str:

@@ -279,6 +279,8 @@ class PerfReviewTests(unittest.TestCase):
             self.assertGreater(claim_count, 0)
             self_review = (root / ".perf_review" / "output" / "self_review.md").read_text(encoding="utf-8")
             html_report = (root / ".perf_review" / "output" / "review_report.html").read_text(encoding="utf-8")
+            self.assertIn("Project summary:", self_review)
+            self.assertIn("Total number of projects combined:", self_review)
             self.assertIn("[task:", self_review)
             self.assertIn("<html", html_report)
             db.close()
