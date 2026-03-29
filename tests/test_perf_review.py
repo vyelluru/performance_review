@@ -241,6 +241,82 @@ class PerfReviewTests(unittest.TestCase):
             self.assertTrue(all(row["complexity_score"] >= 0.0 for row in tasks))
             db.close()
 
+    def test_cross_repo_task_merges_shared_workstream(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            repo_a = root / "service-a"
+            repo_b = root / "service-b"
+            docs_dir = root / "docs"
+            docs_dir.mkdir()
+            self._create_shared_issue_repo(
+                repo_a,
+                [
+                    "ABC-789 Build shared ingestion pipeline",
+                    "ABC-789 Add ingestion metrics",
+                ],
+            )
+            self._create_shared_issue_repo(
+                repo_b,
+                [
+                    "ABC-789 Wire shared ingestion hooks",
+                    "ABC-789 Validate ingestion contract",
+                ],
+            )
+            (docs_dir / "rollout.md").write_text(
+                "# Shared ingestion rollout\n\nABC-789 rollout across service-a and service-b with platform coordination.\n",
+                encoding="utf-8",
+            )
+            jira_import = root / "jira.json"
+            jira_import.write_text(
+                json.dumps(
+                    [
+                        {
+                            "key": "ABC-789",
+                            "fields": {
+                                "summary": "Shared ingestion pipeline rollout",
+                                "description": "Coordinate ingestion pipeline updates across service-a and service-b.",
+                                "updated": "2026-03-15T10:00:00Z",
+                                "created": "2026-03-12T10:00:00Z",
+                                "comment": {"comments": []},
+                            },
+                        }
+                    ]
+                ),
+                encoding="utf-8",
+            )
+            current = Path.cwd()
+            try:
+                os.chdir(root)
+                self.assertEqual(0, main(["init"]))
+                self.assertEqual(0, main(["source", "add", "git", "--path", str(repo_a), "--alias", "service-a"]))
+                self.assertEqual(0, main(["source", "add", "git", "--path", str(repo_b), "--alias", "service-b"]))
+                self.assertEqual(0, main(["source", "add", "jira", "--import-path", str(jira_import), "--alias", "jira"]))
+                self.assertEqual(0, main(["source", "add", "confluence", "--import-path", str(docs_dir), "--alias", "docs"]))
+                self.assertEqual(0, main(["ingest"]))
+                self.assertEqual(0, main(["build", "--period", "2026-H1"]))
+            finally:
+                os.chdir(current)
+
+            db = Database(root / ".perf_review" / "perf_review.db")
+            shared_task = db.connection.execute(
+                """
+                select id, title, repo_count, is_cross_repo, repo_names_json, source_anchor
+                from tasks
+                where source_anchor = 'anchor:issue:ABC-789'
+                """
+            ).fetchone()
+            self.assertIsNotNone(shared_task)
+            self.assertEqual("Shared ingestion pipeline rollout", shared_task["title"])
+            self.assertEqual(2, shared_task["repo_count"])
+            self.assertEqual(1, shared_task["is_cross_repo"])
+            self.assertEqual(["service-a", "service-b"], json.loads(shared_task["repo_names_json"]))
+            memberships = db.fetch_task_memberships(int(shared_task["id"]))
+            membership_sources = {row["source_alias"] for row in memberships}
+            self.assertTrue({"service-a", "service-b", "jira", "docs"}.issubset(membership_sources))
+            repo_names = db.fetch_task_repo_names(int(shared_task["id"]))
+            self.assertEqual(["service-a", "service-b"], repo_names)
+            db.close()
+
     def test_keychain_secret_store_shells_out(self) -> None:
         store = MacOSKeychainSecretStore()
         with mock.patch("perf_review.utils.secrets.subprocess.run") as run_mock:
@@ -282,6 +358,18 @@ class PerfReviewTests(unittest.TestCase):
             previous = target.read_text(encoding="utf-8") if target.exists() else ""
             target.write_text(previous + content + "\n", encoding="utf-8")
             subprocess.run(["git", "add", filename], cwd=path, check=True, capture_output=True)
+            subprocess.run(["git", "commit", "-m", message], cwd=path, check=True, capture_output=True)
+
+    def _create_shared_issue_repo(self, path: Path, commit_messages: list[str]) -> None:
+        path.mkdir(parents=True, exist_ok=True)
+        subprocess.run(["git", "init"], cwd=path, check=True, capture_output=True)
+        subprocess.run(["git", "config", "user.name", "Test User"], cwd=path, check=True, capture_output=True)
+        subprocess.run(["git", "config", "user.email", "test@example.com"], cwd=path, check=True, capture_output=True)
+        target = path / "work.txt"
+        for index, message in enumerate(commit_messages, start=1):
+            previous = target.read_text(encoding="utf-8") if target.exists() else ""
+            target.write_text(previous + f"step {index}\n", encoding="utf-8")
+            subprocess.run(["git", "add", "work.txt"], cwd=path, check=True, capture_output=True)
             subprocess.run(["git", "commit", "-m", message], cwd=path, check=True, capture_output=True)
 
 

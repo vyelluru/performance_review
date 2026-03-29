@@ -49,7 +49,7 @@ class Cluster:
     key: str
     artifact_ids: list[int]
     reason: str
-    primary_repo: str | None
+    repo_names: tuple[str, ...]
     title_hint: str | None = None
 
 
@@ -61,6 +61,7 @@ def rebuild_graph_with_enrichment(database: Database, rubric: dict[str, Any], ll
     database.clear_graph()
     database.set_competencies(rubric.get("competencies", []))
     artifacts = [dict(row) for row in database.fetch_artifacts()]
+    artifact_lookup = {artifact["id"]: artifact for artifact in artifacts}
     entity_ids: dict[tuple[str, str], int] = {}
     anchors: dict[str, list[dict[str, Any]]] = defaultdict(list)
     orphan_artifacts: list[dict[str, Any]] = []
@@ -102,7 +103,6 @@ def rebuild_graph_with_enrichment(database: Database, rubric: dict[str, Any], ll
             orphan_artifacts.append(artifact)
 
     initial_clusters = _build_anchor_clusters(anchors)
-    artifact_lookup = {artifact["id"]: artifact for artifact in artifacts}
     semantic_clusters = _build_semantic_clusters(orphan_artifacts)
     merged_clusters = _merge_clusters(initial_clusters + semantic_clusters, artifact_lookup)
 
@@ -130,16 +130,24 @@ def rebuild_graph_with_enrichment(database: Database, rubric: dict[str, Any], ll
             confidence=_cluster_confidence(cluster, cluster_artifacts),
             start_at=start_at,
             end_at=end_at,
-            primary_repo=cluster.primary_repo,
-            metadata={"reason": cluster.reason, "artifact_count": len(cluster.artifact_ids), "title_hint": cluster.title_hint},
+            primary_repo=cluster.repo_names[0] if cluster.repo_names else None,
+            repo_names=list(cluster.repo_names),
+            metadata={
+                "reason": cluster.reason,
+                "artifact_count": len(cluster.artifact_ids),
+                "title_hint": cluster.title_hint,
+                "repo_names": list(cluster.repo_names),
+                "cross_repo": len(cluster.repo_names) > 1,
+            },
         )
         for artifact in cluster_artifacts:
             reason = cluster.reason
             score = 1.0 if cluster.reason.startswith("anchor") else 0.65
             database.insert_task_membership(task_id, artifact["id"], score, reason)
             database.insert_edge("artifact", artifact["id"], "supports", "task", task_id, artifact["id"], confidence=score)
-        if cluster.primary_repo and ("repo", cluster.primary_repo) in entity_ids:
-            database.insert_edge("task", task_id, "belongs_to", "entity", entity_ids[("repo", cluster.primary_repo)], confidence=1.0)
+        for repo_name in cluster.repo_names:
+            if ("repo", repo_name) in entity_ids:
+                database.insert_edge("task", task_id, "belongs_to", "entity", entity_ids[("repo", repo_name)], confidence=1.0)
     database.commit()
 
 
@@ -153,68 +161,71 @@ def _build_anchor_clusters(anchors: dict[str, list[dict[str, Any]]]) -> list[Clu
         unique_ids = sorted({artifact["id"] for artifact in items})
         if not unique_ids:
             continue
-        repo_names = [json.loads(artifact["metadata_json"]).get("repo_name") or json.loads(artifact["metadata_json"]).get("repo") for artifact in items]
-        primary_repo = next((repo for repo in repo_names if repo), None)
-        clusters.append(Cluster(key=slugify(key), artifact_ids=unique_ids, reason=f"anchor:{key}", primary_repo=primary_repo, title_hint=_anchor_title_hint(key, items)))
+        repo_names = _cluster_repo_names(items)
+        clusters.append(
+            Cluster(
+                key=slugify(key),
+                artifact_ids=unique_ids,
+                reason=f"anchor:{key}",
+                repo_names=repo_names,
+                title_hint=_anchor_title_hint(key, items),
+            )
+        )
     return clusters
 
 
 def _build_semantic_clusters(orphan_artifacts: list[dict[str, Any]]) -> list[Cluster]:
-    by_scope: dict[str, list[dict[str, Any]]] = defaultdict(list)
-    for artifact in orphan_artifacts:
-        metadata = json.loads(artifact["metadata_json"])
-        repo_name = metadata.get("repo_name") or metadata.get("repo")
-        scope = repo_name or "global"
-        by_scope[scope].append(artifact)
-
     clusters: list[Cluster] = []
-    for scope, scoped_artifacts in by_scope.items():
-        token_to_ids: dict[str, list[int]] = defaultdict(list)
-        artifact_tokens: dict[int, list[str]] = {}
-        for artifact in scoped_artifacts:
-            tokens = _topic_tokens(artifact, None if scope == "global" else scope)
-            artifact_tokens[artifact["id"]] = tokens
-            for token in set(tokens):
-                token_to_ids[token].append(artifact["id"])
+    token_to_ids: dict[str, list[int]] = defaultdict(list)
+    artifact_lookup = {artifact["id"]: artifact for artifact in orphan_artifacts}
+    for artifact in orphan_artifacts:
+        metadata = _load_json(artifact["metadata_json"])
+        repo_name = metadata.get("repo_name") or metadata.get("repo")
+        tokens = _topic_tokens(artifact, repo_name)
+        for token in set(tokens):
+            token_to_ids[token].append(artifact["id"])
 
-        used: set[int] = set()
-        prioritized_tokens = sorted(
-            (
-                (token, len(ids))
-                for token, ids in token_to_ids.items()
-                if len(ids) >= 2
-            ),
-            key=lambda item: (-item[1], item[0]),
+    used: set[int] = set()
+    prioritized_tokens = sorted(
+        (
+            (token, len(ids))
+            for token, ids in token_to_ids.items()
+            if len(ids) >= 2
+        ),
+        key=lambda item: (-item[1], item[0]),
+    )
+    for token, _ in prioritized_tokens:
+        candidate_ids = sorted(artifact_id for artifact_id in token_to_ids[token] if artifact_id not in used)
+        if len(candidate_ids) < 2:
+            continue
+        candidate_artifacts = [artifact_lookup[artifact_id] for artifact_id in candidate_ids]
+        repo_names = _cluster_repo_names(candidate_artifacts)
+        scope = "global" if len(repo_names) > 1 else (repo_names[0] if repo_names else "global")
+        title_hint = _semantic_title_hint(token, orphan_artifacts, candidate_ids)
+        used.update(candidate_ids)
+        clusters.append(
+            Cluster(
+                key=slugify(f"topic:{scope}:{token}"),
+                artifact_ids=candidate_ids,
+                reason=f"semantic:token:{token}",
+                repo_names=repo_names,
+                title_hint=title_hint,
+            )
         )
-        for token, _ in prioritized_tokens:
-            candidate_ids = sorted(artifact_id for artifact_id in token_to_ids[token] if artifact_id not in used)
-            if len(candidate_ids) < 2:
-                continue
-            used.update(candidate_ids)
-            title_hint = _semantic_title_hint(token, scoped_artifacts, candidate_ids)
-            clusters.append(
-                Cluster(
-                    key=slugify(f"topic:{scope}:{token}"),
-                    artifact_ids=candidate_ids,
-                    reason=f"semantic:token:{token}",
-                    primary_repo=None if scope == "global" else scope,
-                    title_hint=title_hint,
-                )
-            )
 
-        for artifact in scoped_artifacts:
-            if artifact["id"] in used:
-                continue
-            title_hint = summarize_text(artifact["title"], 80)
-            clusters.append(
-                Cluster(
-                    key=slugify(f"artifact:{scope}:{artifact['id']}"),
-                    artifact_ids=[artifact["id"]],
-                    reason="semantic:singleton",
-                    primary_repo=None if scope == "global" else scope,
-                    title_hint=title_hint,
-                )
+    for artifact in orphan_artifacts:
+        if artifact["id"] in used:
+            continue
+        title_hint = summarize_text(artifact["title"], 80)
+        clusters.append(
+            Cluster(
+                key=slugify(f"artifact:{artifact['id']}"),
+                artifact_ids=[artifact["id"]],
+                reason="semantic:singleton",
+                repo_names=_cluster_repo_names([artifact]),
+                title_hint=title_hint,
             )
+        )
     return clusters
 
 
@@ -226,7 +237,7 @@ def _merge_clusters(clusters: list[Cluster], artifact_lookup: dict[int, dict[str
             continue
         current_ids = set(cluster.artifact_ids)
         current_reason = cluster.reason
-        primary_repo = cluster.primary_repo
+        repo_names = set(cluster.repo_names)
         title_hint = cluster.title_hint
         signature = _cluster_signature(cluster, artifact_lookup)
         for other_index in range(index + 1, len(clusters)):
@@ -235,16 +246,25 @@ def _merge_clusters(clusters: list[Cluster], artifact_lookup: dict[int, dict[str
             other = clusters[other_index]
             other_signature = _cluster_signature(other, artifact_lookup)
             similarity = _cosine(signature, other_signature)
-            if similarity >= 0.58 and (primary_repo is None or other.primary_repo is None or primary_repo == other.primary_repo):
+            if similarity >= _merge_threshold(cluster, other, artifact_lookup):
                 current_ids.update(other.artifact_ids)
                 consumed.add(other_index)
                 if current_reason.startswith("anchor"):
                     current_reason = "merged:" + current_reason
                 else:
                     current_reason = "merged:semantic"
-                primary_repo = primary_repo or other.primary_repo
+                repo_names.update(other.repo_names)
                 title_hint = title_hint or other.title_hint
-        merged.append(Cluster(key=cluster.key, artifact_ids=sorted(current_ids), reason=current_reason, primary_repo=primary_repo, title_hint=title_hint))
+                signature.update(other_signature)
+        merged.append(
+            Cluster(
+                key=cluster.key,
+                artifact_ids=sorted(current_ids),
+                reason=current_reason,
+                repo_names=tuple(sorted(repo_names)),
+                title_hint=title_hint,
+            )
+        )
     return merged
 
 
@@ -257,6 +277,49 @@ def _cluster_signature(cluster: Cluster, artifact_lookup: dict[int, dict[str, An
         tokens = tokenize(f"{artifact['title']} {artifact['body_text']}")
         counter.update(tokens)
     return counter
+
+
+def _cluster_repo_names(artifacts: list[dict[str, Any]]) -> tuple[str, ...]:
+    repo_names: set[str] = set()
+    for artifact in artifacts:
+        metadata = _load_json(artifact["metadata_json"])
+        repo_name = metadata.get("repo_name") or metadata.get("repo")
+        if repo_name:
+            repo_names.add(repo_name)
+    return tuple(sorted(repo_names))
+
+
+def _merge_threshold(cluster: Cluster, other: Cluster, artifact_lookup: dict[int, dict[str, Any]]) -> float:
+    threshold = 0.58
+    shared_repos = bool(set(cluster.repo_names) & set(other.repo_names))
+    if not shared_repos:
+        threshold += 0.1
+    if not _clusters_time_related(cluster, other, artifact_lookup):
+        threshold += 0.08
+    if cluster.reason.startswith("anchor:issue:") or other.reason.startswith("anchor:issue:"):
+        threshold -= 0.1
+    return max(0.45, min(0.85, threshold))
+
+
+def _clusters_time_related(cluster: Cluster, other: Cluster, artifact_lookup: dict[int, dict[str, Any]]) -> bool:
+    cluster_times = _cluster_timestamps(cluster, artifact_lookup)
+    other_times = _cluster_timestamps(other, artifact_lookup)
+    if not cluster_times or not other_times:
+        return True
+    cluster_start = min(cluster_times)
+    cluster_end = max(cluster_times)
+    other_start = min(other_times)
+    other_end = max(other_times)
+    return not (cluster_end < other_start or other_end < cluster_start)
+
+
+def _cluster_timestamps(cluster: Cluster, artifact_lookup: dict[int, dict[str, Any]]) -> list[str]:
+    timestamps: list[str] = []
+    for artifact_id in cluster.artifact_ids:
+        artifact = artifact_lookup.get(artifact_id)
+        if artifact and artifact.get("occurred_at"):
+            timestamps.append(str(artifact["occurred_at"]))
+    return timestamps
 
 
 def _cosine(left: Counter[str], right: Counter[str]) -> float:
@@ -293,6 +356,10 @@ def _artifact_anchor_parts(artifact: dict[str, Any], combined_text: str) -> tupl
     urls = extract_urls(combined_text)
     pr_refs = extract_pr_refs(combined_text)
     branch_keys: list[str] = []
+    if artifact["artifact_type"] == "issue":
+        issue_keys = sorted({*issue_keys, artifact["external_id"]})
+    if artifact["artifact_type"] == "pr":
+        pr_refs = sorted({*pr_refs, artifact["external_id"].split("#")[-1]})
     if artifact["artifact_type"] == "branch":
         branch_name = artifact["title"].strip()
         if branch_name and branch_name.lower() not in DEFAULT_BRANCH_NAMES:

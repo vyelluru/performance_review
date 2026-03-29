@@ -115,6 +115,9 @@ SCHEMA_STATEMENTS = [
       start_at text,
       end_at text,
       primary_repo text,
+      repo_count integer not null default 0,
+      is_cross_repo integer not null default 0,
+      repo_names_json text not null default '[]',
       metadata_json text not null,
       created_at text not null,
       updated_at text not null
@@ -215,6 +218,9 @@ class Database:
                 "complexity_reasoning": "text not null default ''",
                 "status": "text not null default 'inferred'",
                 "source_anchor": "text",
+                "repo_count": "integer not null default 0",
+                "is_cross_repo": "integer not null default 0",
+                "repo_names_json": "text not null default '[]'",
             },
         )
 
@@ -434,17 +440,21 @@ class Database:
         start_at: str | None,
         end_at: str | None,
         primary_repo: str | None,
+        repo_names: list[str],
         metadata: dict[str, Any],
     ) -> int:
         now = utcnow_iso()
+        repo_names = sorted({repo_name for repo_name in repo_names if repo_name})
+        repo_count = len(repo_names)
+        is_cross_repo = int(repo_count > 1)
         self.connection.execute(
             """
             insert into tasks(
               task_key, title, description, summary, implementation_summary, impact_summary, collaboration_summary,
               complexity_score, complexity_reasoning, status, source_anchor, confidence, start_at, end_at, primary_repo,
-              metadata_json, created_at, updated_at
+              repo_count, is_cross_repo, repo_names_json, metadata_json, created_at, updated_at
             )
-            values (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            values (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             on conflict(task_key) do update set
               title=excluded.title,
               description=excluded.description,
@@ -460,6 +470,9 @@ class Database:
               start_at=excluded.start_at,
               end_at=excluded.end_at,
               primary_repo=excluded.primary_repo,
+              repo_count=excluded.repo_count,
+              is_cross_repo=excluded.is_cross_repo,
+              repo_names_json=excluded.repo_names_json,
               metadata_json=excluded.metadata_json,
               updated_at=excluded.updated_at
             """,
@@ -479,6 +492,9 @@ class Database:
                 start_at,
                 end_at,
                 primary_repo,
+                repo_count,
+                is_cross_repo,
+                json.dumps(repo_names),
                 json.dumps(metadata, sort_keys=True),
                 now,
                 now,
@@ -563,7 +579,9 @@ class Database:
     def fetch_task_memberships(self, task_id: int) -> list[sqlite3.Row]:
         return self.connection.execute(
             """
-            select tm.*, a.title, a.body_text, a.artifact_type, a.occurred_at, a.source_alias
+            select tm.*, a.title, a.body_text, a.artifact_type, a.occurred_at, a.source_alias,
+                   json_extract(a.metadata_json, '$.repo_name') as repo_name,
+                   json_extract(a.metadata_json, '$.repo') as metadata_repo
             from task_memberships tm
             join artifacts a on a.id = tm.artifact_id
             where tm.task_id = ?
@@ -571,6 +589,23 @@ class Database:
             """,
             (task_id,),
         ).fetchall()
+
+    def fetch_task_repo_names(self, task_id: int) -> list[str]:
+        rows = self.connection.execute(
+            """
+            select distinct e.display_name
+            from edges rel
+            join entities e on e.id = rel.to_id
+            where rel.from_kind = 'task'
+              and rel.from_id = ?
+              and rel.rel_type = 'belongs_to'
+              and rel.to_kind = 'entity'
+              and e.entity_type = 'repo'
+            order by e.display_name asc
+            """,
+            (task_id,),
+        ).fetchall()
+        return [str(row["display_name"]) for row in rows]
 
     def fetch_competencies(self) -> list[sqlite3.Row]:
         return self.connection.execute("select * from competencies order by competency_id").fetchall()

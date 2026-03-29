@@ -118,16 +118,20 @@ def explain_task(database: Database, task_id: int) -> str:
     if not task:
         return f"Task {task_id} was not found."
     memberships = database.fetch_task_memberships(task_id)
+    repo_names = database.fetch_task_repo_names(task_id)
     lines = [
         f"Task {task['id']}: {task['title']}",
         f"Confidence: {task['confidence']}",
+        f"Repos: {', '.join(repo_names) if repo_names else 'None detected'}",
         f"Description: {task['description']}",
         "Evidence:",
     ]
     for membership in memberships:
+        repo_name = membership["repo_name"] or membership["metadata_repo"]
+        repo_suffix = f", repo={repo_name}" if repo_name else ""
         lines.append(
             f"- [{membership['artifact_id']}] {membership['artifact_type']} from {membership['source_alias']} "
-            f"(score={membership['membership_score']}, reason={membership['membership_reason']}): {membership['title']}"
+            f"(score={membership['membership_score']}, reason={membership['membership_reason']}{repo_suffix}): {membership['title']}"
         )
     return "\n".join(lines)
 
@@ -151,12 +155,17 @@ def write_review_outputs(output_dir: str | Path, artifacts: ReviewRunArtifacts) 
 def _render_evidence_appendix(task_rows: list[dict[str, Any]], database: Database) -> str:
     lines = ["# Evidence Appendix", ""]
     for task in task_rows:
+        repo_names = database.fetch_task_repo_names(task["id"])
         lines.append(f"## Task {task['id']}: {task['title']}")
+        if repo_names:
+            lines.append(f"- Repos involved: {', '.join(repo_names)}")
         memberships = database.fetch_task_memberships(task["id"])
         for membership in memberships:
+            repo_name = membership["repo_name"] or membership["metadata_repo"]
+            repo_suffix = f", repo={repo_name}" if repo_name else ""
             lines.append(
                 f"- Artifact {membership['artifact_id']} ({membership['artifact_type']} via {membership['source_alias']}): "
-                f"{membership['title']} [score={membership['membership_score']}, reason={membership['membership_reason']}]"
+                f"{membership['title']} [score={membership['membership_score']}, reason={membership['membership_reason']}{repo_suffix}]"
             )
         lines.append("")
     return "\n".join(lines).rstrip() + "\n"
