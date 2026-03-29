@@ -128,6 +128,25 @@ class PerfReviewTests(unittest.TestCase):
                 direct = live_connector.fetch("direct", sync_state={})
             self.assertEqual(2, len(direct.artifacts))
 
+    def test_document_import_is_chunked_by_sections(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            docs_root = Path(temp_dir) / "docs"
+            docs_root.mkdir()
+            (docs_root / "notes.md").write_text(
+                "# Launch Plan\nCoordinate rollout with support.\n\n# Reliability Follow-up\nReduce alert fatigue and tune retries.\n",
+                encoding="utf-8",
+            )
+            connector = ConfluenceConnector("docs", {"import_path": str(docs_root)}, MemorySecretStore())
+            imported = connector.fetch("import")
+            doc_artifacts = [artifact for artifact in imported.artifacts if artifact.artifact_type == "doc"]
+            self.assertEqual(2, len(doc_artifacts))
+            self.assertEqual(
+                ["notes - Launch Plan", "notes - Reliability Follow-up"],
+                [artifact.title for artifact in doc_artifacts],
+            )
+            self.assertTrue(all("document_external_id" in artifact.metadata for artifact in doc_artifacts))
+            self.assertEqual([1, 2], [artifact.metadata["chunk_index"] for artifact in doc_artifacts])
+
     def test_github_direct_sync(self) -> None:
         secret_store = MemorySecretStore()
         secret_store.save_token("github-demo", "token")

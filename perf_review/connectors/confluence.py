@@ -7,7 +7,7 @@ from typing import Any
 from perf_review.connectors.base import BaseConnector, ConnectorError, FetchResult
 from perf_review.connectors.http import append_query, auth_headers, http_get_json
 from perf_review.models import ArtifactRecord, RawDocument
-from perf_review.utils.text import extract_text_from_file, html_to_text
+from perf_review.utils.text import chunk_document_text, extract_text_from_file, html_to_text
 
 
 class ConfluenceConnector(BaseConnector):
@@ -37,16 +37,12 @@ class ConfluenceConnector(BaseConnector):
             external_id = str(file_path.resolve())
             payload = {"path": external_id, "title": file_path.stem, "suffix": file_path.suffix.lower(), "text": text}
             raw_documents.append(RawDocument(self.alias, self.source_type, external_id, "import", payload))
-            artifacts.append(
-                ArtifactRecord(
-                    source_alias=self.alias,
-                    source_type=self.source_type,
-                    artifact_type="doc",
+            artifacts.extend(
+                self._document_artifacts(
                     external_id=external_id,
                     title=file_path.stem,
-                    body_text=text,
+                    text=text,
                     author=None,
-                    author_email=None,
                     occurred_at=None,
                     canonical_url=None,
                     metadata={"path": external_id, "suffix": file_path.suffix.lower()},
@@ -99,16 +95,12 @@ class ConfluenceConnector(BaseConnector):
             body_text = html_to_text((((page.get("body") or {}).get("storage") or {}).get("value")) or "")
             external_id = f"page:{page_id}"
             raw_documents.append(RawDocument(self.alias, self.source_type, external_id, "direct", page))
-            artifacts.append(
-                ArtifactRecord(
-                    source_alias=self.alias,
-                    source_type=self.source_type,
-                    artifact_type="doc",
+            artifacts.extend(
+                self._document_artifacts(
                     external_id=external_id,
                     title=title,
-                    body_text=body_text,
+                    text=body_text,
                     author=((page.get("history") or {}).get("createdBy") or {}).get("displayName"),
-                    author_email=None,
                     occurred_at=((page.get("version") or {}).get("when")),
                     canonical_url=f"{base_url}{(page.get('_links') or {}).get('webui', '')}" if (page.get("_links") or {}).get("webui") else None,
                     metadata={"space": space, "labels": [label.get("name") for label in ((page.get("metadata") or {}).get("labels") or {}).get("results", [])]},
@@ -134,6 +126,41 @@ class ConfluenceConnector(BaseConnector):
                     )
                 )
         return FetchResult(raw_documents=raw_documents, artifacts=artifacts, cursor=str(newest_seen) if newest_seen else None)
+
+    def _document_artifacts(
+        self,
+        external_id: str,
+        title: str,
+        text: str,
+        author: str | None,
+        occurred_at: str | None,
+        canonical_url: str | None,
+        metadata: dict[str, Any],
+    ) -> list[ArtifactRecord]:
+        artifacts: list[ArtifactRecord] = []
+        for chunk in chunk_document_text(title, text):
+            artifacts.append(
+                ArtifactRecord(
+                    source_alias=self.alias,
+                    source_type=self.source_type,
+                    artifact_type="doc",
+                    external_id=f"{external_id}#chunk-{chunk.chunk_index}",
+                    title=chunk.title,
+                    body_text=chunk.body_text,
+                    author=author,
+                    author_email=None,
+                    occurred_at=occurred_at,
+                    canonical_url=canonical_url,
+                    metadata={
+                        **metadata,
+                        "document_external_id": external_id,
+                        "chunk_index": chunk.chunk_index,
+                        "section_title": chunk.section_title,
+                        "heading_path": chunk.heading_path,
+                    },
+                )
+            )
+        return artifacts
 
     @staticmethod
     def _fetch_comments(base_url: str, page_id: str, headers: dict[str, str]) -> list[dict[str, Any]]:
