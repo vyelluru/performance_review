@@ -107,6 +107,7 @@ SCHEMA_STATEMENTS = [
       implementation_summary text not null default '',
       impact_summary text not null default '',
       collaboration_summary text not null default '',
+      challenge_summary text not null default '',
       complexity_score real not null default 0.0,
       complexity_reasoning text not null default '',
       status text not null default 'inferred',
@@ -115,8 +116,14 @@ SCHEMA_STATEMENTS = [
       start_at text,
       end_at text,
       primary_repo text,
+      story_points real,
+      artifact_count integer not null default 0,
       repo_count integer not null default 0,
       is_cross_repo integer not null default 0,
+      people_json text not null default '[]',
+      jira_keys_json text not null default '[]',
+      labels_json text not null default '[]',
+      issue_types_json text not null default '[]',
       repo_names_json text not null default '[]',
       metadata_json text not null,
       created_at text not null,
@@ -214,12 +221,19 @@ class Database:
                 "implementation_summary": "text not null default ''",
                 "impact_summary": "text not null default ''",
                 "collaboration_summary": "text not null default ''",
+                "challenge_summary": "text not null default ''",
                 "complexity_score": "real not null default 0.0",
                 "complexity_reasoning": "text not null default ''",
                 "status": "text not null default 'inferred'",
                 "source_anchor": "text",
+                "story_points": "real",
+                "artifact_count": "integer not null default 0",
                 "repo_count": "integer not null default 0",
                 "is_cross_repo": "integer not null default 0",
+                "people_json": "text not null default '[]'",
+                "jira_keys_json": "text not null default '[]'",
+                "labels_json": "text not null default '[]'",
+                "issue_types_json": "text not null default '[]'",
                 "repo_names_json": "text not null default '[]'",
             },
         )
@@ -432,6 +446,7 @@ class Database:
         implementation_summary: str,
         impact_summary: str,
         collaboration_summary: str,
+        challenge_summary: str,
         complexity_score: float,
         complexity_reasoning: str,
         status: str,
@@ -440,21 +455,32 @@ class Database:
         start_at: str | None,
         end_at: str | None,
         primary_repo: str | None,
+        story_points: float | int | None,
+        artifact_count: int,
+        people: list[str],
+        jira_keys: list[str],
+        labels: list[str],
+        issue_types: list[str],
         repo_names: list[str],
         metadata: dict[str, Any],
     ) -> int:
         now = utcnow_iso()
         repo_names = sorted({repo_name for repo_name in repo_names if repo_name})
+        people = sorted({person for person in people if person})
+        jira_keys = sorted({jira_key for jira_key in jira_keys if jira_key})
+        labels = sorted({label for label in labels if label})
+        issue_types = sorted({issue_type for issue_type in issue_types if issue_type})
         repo_count = len(repo_names)
         is_cross_repo = int(repo_count > 1)
         self.connection.execute(
             """
             insert into tasks(
               task_key, title, description, summary, implementation_summary, impact_summary, collaboration_summary,
-              complexity_score, complexity_reasoning, status, source_anchor, confidence, start_at, end_at, primary_repo,
-              repo_count, is_cross_repo, repo_names_json, metadata_json, created_at, updated_at
+              challenge_summary, complexity_score, complexity_reasoning, status, source_anchor, confidence, start_at, end_at, primary_repo,
+              story_points, artifact_count, repo_count, is_cross_repo, people_json, jira_keys_json, labels_json, issue_types_json,
+              repo_names_json, metadata_json, created_at, updated_at
             )
-            values (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            values (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             on conflict(task_key) do update set
               title=excluded.title,
               description=excluded.description,
@@ -462,6 +488,7 @@ class Database:
               implementation_summary=excluded.implementation_summary,
               impact_summary=excluded.impact_summary,
               collaboration_summary=excluded.collaboration_summary,
+              challenge_summary=excluded.challenge_summary,
               complexity_score=excluded.complexity_score,
               complexity_reasoning=excluded.complexity_reasoning,
               status=excluded.status,
@@ -470,8 +497,14 @@ class Database:
               start_at=excluded.start_at,
               end_at=excluded.end_at,
               primary_repo=excluded.primary_repo,
+              story_points=excluded.story_points,
+              artifact_count=excluded.artifact_count,
               repo_count=excluded.repo_count,
               is_cross_repo=excluded.is_cross_repo,
+              people_json=excluded.people_json,
+              jira_keys_json=excluded.jira_keys_json,
+              labels_json=excluded.labels_json,
+              issue_types_json=excluded.issue_types_json,
               repo_names_json=excluded.repo_names_json,
               metadata_json=excluded.metadata_json,
               updated_at=excluded.updated_at
@@ -484,6 +517,7 @@ class Database:
                 implementation_summary,
                 impact_summary,
                 collaboration_summary,
+                challenge_summary,
                 complexity_score,
                 complexity_reasoning,
                 status,
@@ -492,8 +526,14 @@ class Database:
                 start_at,
                 end_at,
                 primary_repo,
+                story_points,
+                artifact_count,
                 repo_count,
                 is_cross_repo,
+                json.dumps(people),
+                json.dumps(jira_keys),
+                json.dumps(labels),
+                json.dumps(issue_types),
                 json.dumps(repo_names),
                 json.dumps(metadata, sort_keys=True),
                 now,

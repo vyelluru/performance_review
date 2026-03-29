@@ -19,6 +19,7 @@ from perf_review.review.engine import generate_review
 from perf_review.store.db import Database
 from perf_review.utils.config import ConfigManager, add_source
 from perf_review.utils.secrets import MacOSKeychainSecretStore, MemorySecretStore
+from perf_review.utils.text import flatten_atlassian_doc
 from perf_review.utils.time import parse_period
 
 
@@ -201,6 +202,43 @@ class PerfReviewTests(unittest.TestCase):
             self.assertTrue(all("document_external_id" in artifact.metadata for artifact in doc_artifacts))
             self.assertEqual([1, 2], [artifact.metadata["chunk_index"] for artifact in doc_artifacts])
 
+    def test_flatten_atlassian_doc_ignores_adf_node_labels(self) -> None:
+        payload = {
+            "type": "doc",
+            "version": 1,
+            "content": [
+                {
+                    "type": "blockquote",
+                    "content": [
+                        {
+                            "type": "paragraph",
+                            "content": [
+                                {"type": "text", "text": "Priority on this"},
+                                {"type": "hardBreak"},
+                                {"type": "text", "text": "Ship blocker"},
+                            ],
+                        }
+                    ],
+                },
+                {
+                    "type": "bulletList",
+                    "content": [
+                        {
+                            "type": "listItem",
+                            "content": [{"type": "paragraph", "content": [{"type": "text", "text": "Coordinate rollout"}]}],
+                        }
+                    ],
+                },
+            ],
+        }
+        flattened = flatten_atlassian_doc(payload)
+        self.assertIn("Priority on this", flattened)
+        self.assertIn("Ship blocker", flattened)
+        self.assertIn("- Coordinate rollout", flattened)
+        self.assertNotIn("blockquote", flattened)
+        self.assertNotIn("paragraph", flattened)
+        self.assertNotIn("doc", flattened)
+
     def test_github_direct_sync(self) -> None:
         secret_store = MemorySecretStore()
         secret_store.save_token("github-demo", "token")
@@ -375,7 +413,7 @@ class PerfReviewTests(unittest.TestCase):
             db = Database(root / ".perf_review" / "perf_review.db")
             shared_task = db.connection.execute(
                 """
-                select id, title, repo_count, is_cross_repo, repo_names_json, source_anchor
+                select id, title, description, artifact_count, repo_count, is_cross_repo, repo_names_json, jira_keys_json, source_anchor
                 from tasks
                 where source_anchor = 'anchor:issue:ABC-789'
                 """
@@ -385,6 +423,9 @@ class PerfReviewTests(unittest.TestCase):
             self.assertEqual(2, shared_task["repo_count"])
             self.assertEqual(1, shared_task["is_cross_repo"])
             self.assertEqual(["service-a", "service-b"], json.loads(shared_task["repo_names_json"]))
+            self.assertEqual(["ABC-789"], json.loads(shared_task["jira_keys_json"]))
+            self.assertGreaterEqual(shared_task["artifact_count"], 6)
+            self.assertIn("Coordinate ingestion pipeline updates", shared_task["description"])
             memberships = db.fetch_task_memberships(int(shared_task["id"]))
             membership_sources = {row["source_alias"] for row in memberships}
             self.assertTrue({"service-a", "service-b", "jira", "docs"}.issubset(membership_sources))

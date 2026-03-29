@@ -10,5 +10,70 @@
     "output_dir": ".perf_review/output",
     "redactions": []
   },
-  "sources": []
+  "sources": [
+    {
+      "alias": "test",
+      "config": {
+        "auth_username": "vyelluru@gmail.com",
+        "base_url": "https://vyelluru.atlassian.net",
+        "import_path": null,
+        "project": "KAN"
+      },
+      "enabled": true,
+      "ingest_modes": [
+        "direct"
+      ],
+      "source_type": "jira"
+    },
+    {
+      "alias": "devtools-cli",
+      "config": {
+        "path": "/Users/varunyelluru/devtools-cli"
+      },
+      "enabled": true,
+      "ingest_modes": [
+        "local"
+      ],
+      "source_type": "git"
+    },
+    {
+      "alias": "devtools-core",
+      "config": {
+        "path": "/Users/varunyelluru/devtools-core"
+      },
+      "enabled": true,
+      "ingest_modes": [
+        "local"
+      ],
+      "source_type": "git"
+    },
+    {
+      "alias": "engineering-notes",
+      "config": {
+        "auth_username": null,
+        "base_url": null,
+        "import_path": "/Users/varunyelluru/Downloads/engineering_notes.pdf",
+        "space": null
+      },
+      "enabled": true,
+      "ingest_modes": [
+        "import"
+      ],
+      "source_type": "confluence"
+    },
+    {
+      "alias": "engineering-docs",
+      "config": {
+        "auth_username": null,
+        "base_url": null,
+        "import_path": "/Users/varunyelluru/Downloads/engineering_docs.pdf",
+        "space": null
+      },
+      "enabled": true,
+      "ingest_modes": [
+        "import"
+      ],
+      "source_type": "confluence"
+    }
+  ]
 }

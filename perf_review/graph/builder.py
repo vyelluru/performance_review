@@ -109,9 +109,33 @@ def rebuild_graph_with_enrichment(database: Database, rubric: dict[str, Any], ll
     for cluster in merged_clusters:
         cluster_artifacts = [artifact for artifact in artifacts if artifact["id"] in cluster.artifact_ids]
         evidence = _task_evidence_rows(cluster_artifacts)
+        rollup = _task_rollup(cluster, cluster_artifacts, evidence)
         title = _derive_task_title(cluster, cluster_artifacts)
-        enrichment = llm_provider.enrich_task(title, evidence, cluster.reason)
-        description = summarize_text(enrichment["implementation_summary"] or enrichment["summary"] or " ".join(artifact["title"] for artifact in cluster_artifacts), 400)
+        task_context = {
+            "title": title,
+            "description": rollup["description"],
+            "source_anchor": cluster.reason,
+            "confidence": _cluster_confidence(cluster, cluster_artifacts),
+            "artifact_count": rollup["artifact_count"],
+            "repos": rollup["repo_names"],
+            "jira_keys": rollup["jira_keys"],
+            "people": rollup["people"],
+            "labels": rollup["labels"],
+            "issue_types": rollup["issue_types"],
+            "story_points": rollup["story_points"],
+            "status": rollup["status"],
+            "evidence_highlights": rollup["evidence_highlights"],
+            "design_docs": rollup["design_docs"],
+            "code_contributions": rollup["code_contributions"],
+            "challenge_hints": rollup["challenge_hints"],
+        }
+        enrichment = llm_provider.enrich_task(task_context)
+        description = summarize_text(
+            rollup["description"]
+            or enrichment["summary"]
+            or " ".join(artifact["title"] for artifact in cluster_artifacts),
+            400,
+        )
         start_at = earliest(artifact.get("occurred_at") for artifact in cluster_artifacts)
         end_at = latest(artifact.get("occurred_at") for artifact in cluster_artifacts)
         task_key = cluster.key
@@ -123,14 +147,21 @@ def rebuild_graph_with_enrichment(database: Database, rubric: dict[str, Any], ll
             implementation_summary=enrichment["implementation_summary"],
             impact_summary=enrichment["impact_summary"],
             collaboration_summary=enrichment["collaboration_summary"],
+            challenge_summary=enrichment["challenge_summary"],
             complexity_score=float(enrichment["complexity_score"]),
             complexity_reasoning=enrichment["complexity_reasoning"],
-            status=enrichment["status"],
+            status=enrichment["status"] or rollup["status"],
             source_anchor=cluster.reason,
-            confidence=_cluster_confidence(cluster, cluster_artifacts),
+            confidence=task_context["confidence"],
             start_at=start_at,
             end_at=end_at,
             primary_repo=cluster.repo_names[0] if cluster.repo_names else None,
+            story_points=rollup["story_points"],
+            artifact_count=rollup["artifact_count"],
+            people=rollup["people"],
+            jira_keys=rollup["jira_keys"],
+            labels=rollup["labels"],
+            issue_types=rollup["issue_types"],
             repo_names=list(cluster.repo_names),
             metadata={
                 "reason": cluster.reason,
@@ -138,6 +169,11 @@ def rebuild_graph_with_enrichment(database: Database, rubric: dict[str, Any], ll
                 "title_hint": cluster.title_hint,
                 "repo_names": list(cluster.repo_names),
                 "cross_repo": len(cluster.repo_names) > 1,
+                "design_docs": rollup["design_docs"],
+                "code_contributions": rollup["code_contributions"],
+                "challenge_hints": rollup["challenge_hints"],
+                "evidence_highlights": rollup["evidence_highlights"],
+                "description_fragments": rollup["description_fragments"],
             },
         )
         for artifact in cluster_artifacts:
@@ -424,3 +460,97 @@ def _task_evidence_rows(cluster_artifacts: list[dict[str, Any]]) -> list[dict[st
             }
         )
     return evidence
+
+
+def _task_rollup(cluster: Cluster, cluster_artifacts: list[dict[str, Any]], evidence: list[dict[str, Any]]) -> dict[str, Any]:
+    people: set[str] = set()
+    jira_keys: set[str] = set()
+    labels: set[str] = set()
+    issue_types: set[str] = set()
+    statuses: list[str] = []
+    story_points: list[float] = []
+    challenge_hints: list[str] = []
+    design_docs: list[str] = []
+    code_contributions: list[str] = []
+    evidence_highlights: list[str] = []
+    description_fragments: list[str] = []
+
+    for artifact, evidence_item in zip(cluster_artifacts, evidence):
+        metadata = _load_json(artifact["metadata_json"])
+        for key in ("assignee", "reporter", "author"):
+            value = metadata.get(key) or evidence_item.get(key) or artifact.get("author")
+            if isinstance(value, str) and value.strip():
+                people.add(value.strip())
+        artifact_jira_keys = set(extract_issue_keys(f"{artifact['title']} {artifact['body_text']}"))
+        if artifact["artifact_type"] == "issue":
+            artifact_jira_keys.add(artifact["external_id"])
+        if metadata.get("issue_key"):
+            artifact_jira_keys.add(str(metadata["issue_key"]))
+        jira_keys.update(artifact_jira_keys)
+        labels.update(str(label) for label in metadata.get("labels", []) if label)
+        if metadata.get("issue_type"):
+            issue_types.add(str(metadata["issue_type"]))
+        if metadata.get("status"):
+            statuses.append(str(metadata["status"]))
+        if metadata.get("story_points") not in (None, ""):
+            try:
+                story_points.append(float(metadata["story_points"]))
+            except (TypeError, ValueError):
+                pass
+        if artifact["artifact_type"] == "issue" and artifact.get("body_text", "").strip():
+            description_fragments.append(summarize_text(artifact["body_text"], 180))
+        elif artifact["artifact_type"] == "doc" and artifact.get("body_text", "").strip():
+            description_fragments.append(summarize_text(artifact["body_text"], 180))
+        combined_text = f"{artifact['title']} {artifact['body_text']}".lower()
+        if any(keyword in combined_text for keyword in ("risk", "block", "retry", "race", "incident", "401", "auth", "reliability", "migrate", "schema", "validation")):
+            challenge_hints.append(summarize_text(artifact["title"] or artifact["body_text"], 120))
+        if artifact["artifact_type"] == "doc":
+            design_docs.append(artifact["title"])
+        if artifact["artifact_type"] in {"commit", "pr", "issue"}:
+            code_contributions.append(artifact["title"])
+        evidence_highlights.append(_artifact_highlight(evidence_item))
+
+    status = Counter(statuses).most_common(1)[0][0] if statuses else "inferred"
+    story_points_value = max(story_points) if story_points else None
+    description_fragments = _dedupe_preserve_order(description_fragments)
+    description = summarize_text(
+        " ".join(description_fragments[:2])
+        or " ".join(_dedupe_preserve_order(evidence_highlights[:2])),
+        280,
+    )
+    return {
+        "artifact_count": len(cluster_artifacts),
+        "description": description,
+        "description_fragments": description_fragments[:5],
+        "people": sorted(people),
+        "jira_keys": sorted(jira_keys),
+        "labels": sorted(labels),
+        "issue_types": sorted(issue_types),
+        "status": status,
+        "story_points": int(story_points_value) if isinstance(story_points_value, float) and story_points_value.is_integer() else story_points_value,
+        "repo_names": list(cluster.repo_names),
+        "challenge_hints": _dedupe_preserve_order(challenge_hints)[:5],
+        "design_docs": _dedupe_preserve_order(design_docs)[:5],
+        "code_contributions": _dedupe_preserve_order(code_contributions)[:8],
+        "evidence_highlights": _dedupe_preserve_order(evidence_highlights)[:8],
+    }
+
+
+def _artifact_highlight(evidence_item: dict[str, Any]) -> str:
+    title = evidence_item.get("title") or "Untitled artifact"
+    body = (evidence_item.get("body_text") or "").strip()
+    if body:
+        return f"{title}: {summarize_text(body, 120)}"
+    return title
+
+
+def _dedupe_preserve_order(values: list[str]) -> list[str]:
+    seen: set[str] = set()
+    result: list[str] = []
+    for value in values:
+        normalized = value.strip()
+        if not normalized or normalized in seen:
+            continue
+        seen.add(normalized)
+        result.append(normalized)
+    return result

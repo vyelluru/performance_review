@@ -52,18 +52,30 @@ def generate_review(database: Database, llm_provider: BaseLLMProvider, rubric: d
         all_evidence.extend(evidence)
         if task["confidence"] < 0.7:
             weak_tasks.append(task["title"])
+        metadata = json.loads(task.get("metadata_json") or "{}")
         project_payload = {
             "title": task["title"],
+            "description": task.get("description") or "",
             "summary": task.get("summary") or llm_provider.summarize_task(task["title"], evidence),
             "implementation_summary": task.get("implementation_summary") or task.get("summary") or task["title"],
             "impact_summary": task.get("impact_summary") or "",
             "collaboration_summary": task.get("collaboration_summary") or "",
+            "challenge_summary": task.get("challenge_summary") or "",
             "complexity_reasoning": task.get("complexity_reasoning") or "",
             "complexity_score": task.get("complexity_score") or 0.0,
             "status": task.get("status") or "inferred",
             "repos": database.fetch_task_repo_names(task["id"]),
+            "jira_keys": json.loads(task.get("jira_keys_json") or "[]"),
+            "people": json.loads(task.get("people_json") or "[]"),
+            "labels": json.loads(task.get("labels_json") or "[]"),
+            "issue_types": json.loads(task.get("issue_types_json") or "[]"),
+            "story_points": task.get("story_points"),
+            "artifact_count": task.get("artifact_count") or len(evidence),
             "timeframe": _format_timeframe(task.get("start_at"), task.get("end_at")),
-            "evidence": evidence[:8],
+            "evidence_highlights": metadata.get("evidence_highlights", [item["title"] for item in evidence[:5]]),
+            "design_docs": metadata.get("design_docs", []),
+            "code_contributions": metadata.get("code_contributions", [item["title"] for item in evidence if item.get("artifact_type") in {"commit", "pr", "issue"}][:6]),
+            "challenge_hints": metadata.get("challenge_hints", []),
         }
         drafted_entry = llm_provider.draft_project_entry(project_payload)
         citation = _citation_suffix(task["id"], [item["artifact_id"] for item in evidence[:5]])
@@ -142,6 +154,10 @@ def explain_task(database: Database, task_id: int) -> str:
         f"Confidence: {task['confidence']}",
         f"Repos: {', '.join(repo_names) if repo_names else 'None detected'}",
         f"Description: {task['description']}",
+        f"Jira keys: {', '.join(json.loads(task['jira_keys_json'] or '[]')) or 'None'}",
+        f"People: {', '.join(json.loads(task['people_json'] or '[]')) or 'None'}",
+        f"Story points: {task['story_points'] if task['story_points'] is not None else 'None'}",
+        f"Challenges: {task['challenge_summary'] or 'None captured'}",
         "Evidence:",
     ]
     for membership in memberships:

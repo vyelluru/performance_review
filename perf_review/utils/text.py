@@ -66,11 +66,49 @@ def flatten_atlassian_doc(value: Any) -> str:
     if isinstance(value, str):
         return value
     if isinstance(value, dict):
-        text_parts = [flatten_atlassian_doc(item) for item in value.values()]
-        return " ".join(part for part in text_parts if part)
+        if "text" in value and isinstance(value["text"], str):
+            return value["text"]
+        node_type = value.get("type")
+        if node_type == "hardBreak":
+            return "\n"
+        if "content" in value and isinstance(value["content"], list):
+            child_texts = [_flatten_atlassian_nodes(value["content"])]
+            joined = child_texts[0]
+            if node_type in {"paragraph", "heading", "blockquote", "listItem", "tableCell", "tableHeader"}:
+                return joined.strip()
+            if node_type in {"bulletList", "orderedList", "table", "tableRow", "doc"}:
+                return joined
+            return joined.strip()
+        text_parts = [
+            flatten_atlassian_doc(item)
+            for key, item in value.items()
+            if key not in {"type", "version", "attrs", "marks"}
+        ]
+        return _normalize_whitespace(" ".join(part for part in text_parts if part))
     if isinstance(value, list):
-        return " ".join(flatten_atlassian_doc(item) for item in value if item is not None)
+        return _flatten_atlassian_nodes(value)
     return str(value)
+
+
+def _flatten_atlassian_nodes(nodes: list[Any]) -> str:
+    rendered: list[str] = []
+    for node in nodes:
+        text = flatten_atlassian_doc(node)
+        if not text:
+            continue
+        if isinstance(node, dict):
+            node_type = node.get("type")
+            if node_type == "listItem":
+                text = f"- {_normalize_whitespace(text)}"
+            elif node_type in {"paragraph", "heading", "blockquote", "tableRow"}:
+                text = _normalize_whitespace(text)
+        rendered.append(text)
+    return "\n".join(part for part in rendered if part).strip()
+
+
+def _normalize_whitespace(text: str) -> str:
+    lines = [" ".join(line.split()) for line in text.splitlines()]
+    return "\n".join(line for line in lines if line).strip()
 
 
 def tokenize(text: str) -> list[str]:
