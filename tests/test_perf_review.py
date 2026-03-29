@@ -47,6 +47,13 @@ class PerfReviewTests(unittest.TestCase):
                                 "description": "Shipped onboarding flow to beta customers",
                                 "updated": "2026-03-01T10:00:00Z",
                                 "created": "2026-02-28T10:00:00Z",
+                                "status": {"name": "Done"},
+                                "priority": {"name": "High"},
+                                "issuetype": {"name": "Story"},
+                                "assignee": {"displayName": "Engineer"},
+                                "reporter": {"displayName": "Manager"},
+                                "labels": ["launch"],
+                                "customfield_10016": 5,
                                 "comment": {"comments": [{"id": "c1", "body": "Coordinated rollout", "created": "2026-03-02T10:00:00Z", "author": {"displayName": "Teammate"}}]},
                             },
                         }
@@ -57,6 +64,12 @@ class PerfReviewTests(unittest.TestCase):
             connector = JiraConnector("jira-demo", {"import_path": str(import_path)}, MemorySecretStore())
             imported = connector.fetch("import")
             self.assertEqual(2, len(imported.artifacts))
+            issue_artifact = next(artifact for artifact in imported.artifacts if artifact.artifact_type == "issue")
+            self.assertEqual("Engineer", issue_artifact.metadata["assignee"])
+            self.assertEqual("Done", issue_artifact.metadata["status"])
+            self.assertEqual("High", issue_artifact.metadata["priority"])
+            self.assertEqual("Story", issue_artifact.metadata["issue_type"])
+            self.assertEqual(5, issue_artifact.metadata["story_points"])
 
             secret_store = MemorySecretStore()
             secret_store.save_token("jira-live", "token")
@@ -74,6 +87,13 @@ class PerfReviewTests(unittest.TestCase):
                             "description": {"content": [{"text": "Reduced alert noise"}]},
                             "updated": "2026-03-10T10:00:00Z",
                             "created": "2026-03-08T10:00:00Z",
+                            "status": {"name": "In Progress"},
+                            "priority": {"name": "Medium"},
+                            "issuetype": {"name": "Bug"},
+                            "assignee": {"displayName": "Engineer"},
+                            "reporter": {"displayName": "Lead"},
+                            "labels": ["reliability"],
+                            "customfield_10016": 3,
                             "comment": {"comments": []},
                         },
                     }
@@ -83,6 +103,12 @@ class PerfReviewTests(unittest.TestCase):
             with mock.patch("perf_review.connectors.jira.http_get_json", return_value=payload):
                 direct = live_connector.fetch("direct", sync_state={})
             self.assertEqual(1, len([artifact for artifact in direct.artifacts if artifact.artifact_type == "issue"]))
+            direct_issue = next(artifact for artifact in direct.artifacts if artifact.artifact_type == "issue")
+            self.assertEqual("Engineer", direct_issue.metadata["assignee"])
+            self.assertEqual("In Progress", direct_issue.metadata["status"])
+            self.assertEqual("Medium", direct_issue.metadata["priority"])
+            self.assertEqual("Bug", direct_issue.metadata["issue_type"])
+            self.assertEqual(3, direct_issue.metadata["story_points"])
 
     def test_confluence_import_and_direct_modes(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:

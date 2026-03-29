@@ -59,7 +59,11 @@ class JiraConnector(BaseConnector):
                 f"{base_url}/rest/api/3/search/jql",
                 {
                     "jql": jql,
-                    "fields": "summary,description,status,labels,issuetype,comment,assignee,reporter,updated,created,parent,priority",
+                    "fields": (
+                        "summary,description,status,labels,issuetype,comment,assignee,reporter,"
+                        "updated,created,parent,priority,resolution,resolutiondate,components,"
+                        "customfield_10016,customfield_10020"
+                    ),
                     "maxResults": 50,
                     "startAt": start_at,
                 },
@@ -96,6 +100,18 @@ class JiraConnector(BaseConnector):
             created_at = fields.get("created") or issue.get("Created")
             updated_at = fields.get("updated") or issue.get("Updated")
             reporter = ((fields.get("reporter") or {}).get("displayName") if isinstance(fields.get("reporter"), dict) else issue.get("Reporter"))
+            assignee = self._field_value(fields.get("assignee") or issue.get("Assignee"))
+            status = self._field_value(fields.get("status") or issue.get("Status"))
+            priority = self._field_value(fields.get("priority") or issue.get("Priority"))
+            issue_type = self._field_value(fields.get("issuetype") or issue.get("Issue Type") or issue.get("Issue type"))
+            labels = fields.get("labels") or issue.get("Labels") or []
+            if isinstance(labels, str):
+                labels = [label.strip() for label in labels.split(",") if label.strip()]
+            components = [self._field_value(component) for component in (fields.get("components") or issue.get("Components") or [])]
+            parent_key = self._parent_key(fields.get("parent") or issue.get("Parent"))
+            story_points = self._story_points(fields, issue)
+            resolution = self._field_value(fields.get("resolution") or issue.get("Resolution"))
+            resolved_at = fields.get("resolutiondate") or issue.get("Resolved")
             raw_documents.append(RawDocument(self.alias, self.source_type, key, mode, issue))
             artifacts.append(
                 ArtifactRecord(
@@ -110,10 +126,20 @@ class JiraConnector(BaseConnector):
                     occurred_at=updated_at or created_at,
                     canonical_url=f"{base_url}/browse/{key}" if base_url else None,
                     metadata={
-                        "status": self._field_value(fields.get("status")),
-                        "labels": fields.get("labels") or issue.get("Labels") or [],
-                        "priority": self._field_value(fields.get("priority")),
-                        "assignee": self._field_value(fields.get("assignee")),
+                        "issue_key": key,
+                        "assignee": assignee,
+                        "reporter": reporter,
+                        "status": status,
+                        "priority": priority,
+                        "issue_type": issue_type,
+                        "story_points": story_points,
+                        "labels": labels,
+                        "components": components,
+                        "parent_key": parent_key,
+                        "created_at": created_at,
+                        "updated_at": updated_at,
+                        "resolved_at": resolved_at,
+                        "resolution": resolution,
                     },
                 )
             )
@@ -148,3 +174,36 @@ class JiraConnector(BaseConnector):
         if isinstance(value, dict):
             return value.get("displayName") or value.get("name") or value.get("value") or value.get("key")
         return value
+
+    @staticmethod
+    def _parent_key(value: Any) -> str | None:
+        if isinstance(value, dict):
+            return value.get("key")
+        if isinstance(value, str):
+            return value
+        return None
+
+    @staticmethod
+    def _story_points(fields: dict[str, Any], issue: dict[str, Any]) -> float | int | None:
+        candidates = [
+            fields.get("customfield_10016"),
+            fields.get("customfield_10020"),
+            fields.get("Story Points"),
+            fields.get("Story points"),
+            fields.get("Story point estimate"),
+            issue.get("Story Points"),
+            issue.get("Story points"),
+            issue.get("Story point estimate"),
+        ]
+        for candidate in candidates:
+            if candidate in (None, ""):
+                continue
+            if isinstance(candidate, (int, float)):
+                return candidate
+            if isinstance(candidate, str):
+                try:
+                    numeric = float(candidate)
+                    return int(numeric) if numeric.is_integer() else numeric
+                except ValueError:
+                    continue
+        return None

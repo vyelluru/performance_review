@@ -413,6 +413,14 @@ def _task_evidence_rows(cluster_artifacts: list[dict[str, Any]]) -> list[dict[st
                 "source_alias": artifact["source_alias"],
                 "occurred_at": artifact["occurred_at"],
                 "repo_name": metadata.get("repo_name") or metadata.get("repo"),
+                "issue_key": metadata.get("issue_key") or (artifact["external_id"] if artifact["artifact_type"] == "issue" else None),
+                "assignee": metadata.get("assignee"),
+                "reporter": metadata.get("reporter"),
+                "status": metadata.get("status"),
+                "priority": metadata.get("priority"),
+                "issue_type": metadata.get("issue_type"),
+                "story_points": metadata.get("story_points"),
+                "labels": metadata.get("labels") or [],
             }
         )
     return evidence

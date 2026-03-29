@@ -212,6 +212,15 @@ def _infer_complexity_score(evidence: list[dict[str, Any]], source_anchor: str |
     score = 0.25 + min(0.4, 0.08 * max(0, len(evidence) - 1))
     score += min(0.2, 0.08 * max(0, len(unique_types) - 1))
     score += min(0.15, 0.08 * max(0, len(unique_repos) - 1))
+    max_story_points = max(
+        (
+            float(item.get("story_points"))
+            for item in evidence
+            if item.get("story_points") not in (None, "")
+        ),
+        default=0.0,
+    )
+    score += min(0.15, max_story_points / 40.0)
     if source_anchor and source_anchor.startswith("anchor:issue:"):
         score += 0.1
     return round(min(0.95, score), 2)
@@ -220,9 +229,17 @@ def _infer_complexity_score(evidence: list[dict[str, Any]], source_anchor: str |
 def _infer_complexity_reasoning(evidence: list[dict[str, Any]], source_anchor: str | None, complexity_score: float) -> str:
     unique_types = sorted({item.get("artifact_type") for item in evidence if item.get("artifact_type")})
     unique_repos = sorted({item.get("repo_name") for item in evidence if item.get("repo_name")})
+    max_story_points = max(
+        (
+            float(item.get("story_points"))
+            for item in evidence
+            if item.get("story_points") not in (None, "")
+        ),
+        default=0.0,
+    )
     anchor_text = source_anchor or "semantic clustering"
     return (
         f"Complexity score {complexity_score:.2f} derived from {len(evidence)} evidence items, "
         f"artifact types {', '.join(unique_types) or 'unknown'}, repos {', '.join(unique_repos) or 'none'}, "
-        f"anchored by {anchor_text}."
+        f"max story points {max_story_points:.0f}, anchored by {anchor_text}."
     )
