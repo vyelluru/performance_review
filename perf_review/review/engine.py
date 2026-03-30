@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import html
 import json
+import textwrap
 from collections import Counter
 from datetime import UTC, datetime
 from pathlib import Path
@@ -14,7 +15,14 @@ from perf_review.utils.text import summarize_text
 from perf_review.utils.time import TimeWindow, parse_datetime
 
 
-def generate_review(database: Database, llm_provider: BaseLLMProvider, rubric: dict[str, Any], period: TimeWindow, rubric_path: str) -> tuple[int, ReviewRunArtifacts]:
+def generate_review(
+    database: Database,
+    llm_provider: BaseLLMProvider,
+    rubric: dict[str, Any],
+    period: TimeWindow,
+    rubric_path: str,
+    review_template: str = "",
+) -> tuple[int, ReviewRunArtifacts]:
     task_rows = [dict(row) for row in database.fetch_tasks_for_period(period.start.isoformat(), period.end.isoformat())]
     competency_rows = [dict(row) for row in database.fetch_competencies()]
     competencies = [
@@ -77,7 +85,7 @@ def generate_review(database: Database, llm_provider: BaseLLMProvider, rubric: d
             "code_contributions": metadata.get("code_contributions", [item["title"] for item in evidence if item.get("artifact_type") in {"commit", "pr", "issue"}][:6]),
             "challenge_hints": metadata.get("challenge_hints", []),
         }
-        drafted_entry = llm_provider.draft_project_entry(project_payload)
+        drafted_entry = llm_provider.draft_project_entry(project_payload, review_template)
         citation = _citation_suffix(task["id"], [item["artifact_id"] for item in evidence[:5]])
         claims.append(
             ClaimRecord(
@@ -118,17 +126,19 @@ def generate_review(database: Database, llm_provider: BaseLLMProvider, rubric: d
     database.commit()
 
     missing = _missing_competencies(database, section_order, section_titles)
-    self_review_markdown = _render_self_assessment(period, llm_provider, project_entries, all_evidence)
+    self_review_markdown = _render_self_assessment(period, llm_provider, project_entries, all_evidence, review_template)
 
     evidence_appendix_markdown = _render_evidence_appendix(task_rows, database)
     gaps_markdown = "# Evidence Gaps\n\n" + llm_provider.draft_gaps(missing, weak_tasks) + "\n"
     report_html = _render_html_report(period.label, self_review_markdown, evidence_appendix_markdown, gaps_markdown)
+    report_pdf = _render_pdf_report(period.label, self_review_markdown, evidence_appendix_markdown, gaps_markdown)
     artifacts = ReviewRunArtifacts(
         self_review_markdown=self_review_markdown,
         evidence_appendix_markdown=evidence_appendix_markdown,
         gaps_markdown=gaps_markdown,
         report_html=report_html,
         claims=claims,
+        report_pdf=report_pdf,
     )
     review_run_id = database.create_review_run(
         period_label=period.label,
@@ -177,12 +187,12 @@ def write_review_outputs(output_dir: str | Path, artifacts: ReviewRunArtifacts) 
         "self_review.md": root / "self_review.md",
         "evidence_appendix.md": root / "evidence_appendix.md",
         "gaps.md": root / "gaps.md",
-        "review_report.html": root / "review_report.html",
+        "review_report.pdf": root / "review_report.pdf",
     }
     outputs["self_review.md"].write_text(artifacts.self_review_markdown, encoding="utf-8")
     outputs["evidence_appendix.md"].write_text(artifacts.evidence_appendix_markdown, encoding="utf-8")
     outputs["gaps.md"].write_text(artifacts.gaps_markdown, encoding="utf-8")
-    outputs["review_report.html"].write_text(artifacts.report_html, encoding="utf-8")
+    outputs["review_report.pdf"].write_bytes(artifacts.report_pdf)
     return outputs
 
 
@@ -210,49 +220,86 @@ def _citation_suffix(task_id: int, artifact_ids: list[int]) -> str:
     return f" [task:{task_id}; artifacts:{joined}]"
 
 
-def _render_self_assessment(period: TimeWindow, llm_provider: BaseLLMProvider, project_entries: list[dict[str, Any]], all_evidence: list[dict[str, Any]]) -> str:
+def _render_self_assessment(
+    period: TimeWindow,
+    llm_provider: BaseLLMProvider,
+    project_entries: list[dict[str, Any]],
+    all_evidence: list[dict[str, Any]],
+    review_template: str,
+) -> str:
     generated_on = datetime.now(UTC).strftime("%Y-%b-%d")
     subject_name = _infer_subject_name(all_evidence)
-    intro = llm_provider.draft_portfolio_intro(subject_name, generated_on, len(project_entries), [entry["title"] for entry in project_entries])
+    intro = llm_provider.draft_portfolio_intro(
+        subject_name,
+        generated_on,
+        len(project_entries),
+        [entry["title"] for entry in project_entries],
+        review_template,
+    )
     lines = [f"# {intro}", ""]
     for entry in project_entries:
         draft = entry["draft"]
-        lines.append(f"## {entry['title']}")
-        if entry["timeframe"]:
-            lines.append(f"Timeframe: {entry['timeframe']}")
-        if entry["repos"]:
-            lines.append(f"Repos involved: {', '.join(entry['repos'])}")
-        lines.append("")
-        lines.append(f"Project summary: {draft['project_summary']}{entry['citation']}")
-        lines.append("")
-        lines.append(f"Complexity & difficulty: {draft['complexity_and_difficulty']}")
-        lines.append("")
-        lines.append(f"My impact: {draft['my_impact']}")
-        lines.append("")
-        lines.append("My specific contributions:")
-        for item in draft["specific_contributions"] or ["Contribution details are inferred from the attached evidence."]:
-            lines.append(f"- {item}")
-        lines.append("")
-        lines.append("Technical leadership and code contributions:")
-        lines.append("")
-        lines.append(f"{draft['technical_leadership']}")
-        lines.append("")
-        lines.append("Design docs authored/reviewed:")
-        design_docs = draft["design_docs"] or ["No standalone design docs were attached to this task."]
-        for item in design_docs:
-            lines.append(f"- {item}")
-        lines.append("")
-        lines.append("Code & system contributions:")
-        code_items = draft["code_contributions"] or ["Code and system contributions are represented in the attached evidence."]
-        for item in code_items:
-            lines.append(f"- {item}")
-        lines.append("")
-        lines.append("Initiative & mentorship:")
-        lines.append("")
-        lines.append(f"{draft['initiative_and_mentorship']}")
+        if review_template.strip():
+            block = llm_provider.render_project_markdown(
+                {
+                    "title": entry["title"],
+                    "timeframe": entry["timeframe"],
+                    "repos": entry["repos"],
+                    "citation": entry["citation"],
+                    "draft": draft,
+                },
+                review_template,
+            )
+            lines.append(block.strip())
+            lines.append("")
+            continue
+        lines.append(_default_project_markdown(entry["title"], entry["timeframe"], entry["repos"], draft, entry["citation"]).rstrip())
         lines.append("")
     lines.append(f"Total number of projects combined: {len(project_entries)}")
     return "\n".join(lines).strip() + "\n"
+
+
+def _default_project_markdown(
+    title: str,
+    timeframe: str,
+    repos: list[str],
+    draft: dict[str, Any],
+    citation: str,
+) -> str:
+    lines = [f"## {title}"]
+    if timeframe:
+        lines.append(f"Timeframe: {timeframe}")
+    if repos:
+        lines.append(f"Repos involved: {', '.join(repos)}")
+    lines.append("")
+    lines.append(f"Project summary: {draft['project_summary']}{citation}")
+    lines.append("")
+    lines.append(f"Complexity & difficulty: {draft['complexity_and_difficulty']}")
+    lines.append("")
+    lines.append(f"My impact: {draft['my_impact']}")
+    lines.append("")
+    lines.append("My specific contributions:")
+    for item in draft["specific_contributions"] or ["Contribution details are inferred from the attached evidence."]:
+        lines.append(f"- {item}")
+    lines.append("")
+    lines.append("Technical leadership and code contributions:")
+    lines.append("")
+    lines.append(f"{draft['technical_leadership']}")
+    lines.append("")
+    lines.append("Design docs authored/reviewed:")
+    design_docs = draft["design_docs"] or ["No standalone design docs were attached to this task."]
+    for item in design_docs:
+        lines.append(f"- {item}")
+    lines.append("")
+    lines.append("Code & system contributions:")
+    code_items = draft["code_contributions"] or ["Code and system contributions are represented in the attached evidence."]
+    for item in code_items:
+        lines.append(f"- {item}")
+    lines.append("")
+    lines.append("Initiative & mentorship:")
+    lines.append("")
+    lines.append(f"{draft['initiative_and_mentorship']}")
+    return "\n".join(lines)
 
 
 def _infer_subject_name(evidence: list[dict[str, Any]]) -> str:
@@ -345,3 +392,92 @@ def _render_html_report(period_label: str, self_review_markdown: str, evidence_a
 </body>
 </html>
 """
+
+
+def _render_pdf_report(period_label: str, self_review_markdown: str, evidence_appendix_markdown: str, gaps_markdown: str) -> bytes:
+    content = "\n\n".join(
+        [
+            f"Performance Review Report - {period_label}",
+            self_review_markdown.strip(),
+            evidence_appendix_markdown.strip(),
+            gaps_markdown.strip(),
+        ]
+    ).strip()
+    return _simple_text_pdf(content)
+
+
+def _simple_text_pdf(text: str) -> bytes:
+    wrapped_lines: list[str] = []
+    for raw_line in text.splitlines():
+        line = raw_line.rstrip()
+        if not line:
+            wrapped_lines.append("")
+            continue
+        wrapped_lines.extend(textwrap.wrap(line, width=92) or [""])
+
+    lines_per_page = 48
+    pages = [wrapped_lines[index : index + lines_per_page] for index in range(0, len(wrapped_lines), lines_per_page)] or [[]]
+    objects: list[bytes] = []
+
+    def add_object(data: bytes) -> int:
+        objects.append(data)
+        return len(objects)
+
+    catalog_id = add_object(b"<< /Type /Catalog /Pages 2 0 R >>")
+    pages_placeholder_id = add_object(b"<< /Type /Pages /Count 0 /Kids [] >>")
+    font_id = add_object(b"<< /Type /Font /Subtype /Type1 /BaseFont /Helvetica >>")
+    page_ids: list[int] = []
+    content_ids: list[int] = []
+
+    for page_lines in pages:
+        content_stream = _pdf_page_stream(page_lines)
+        content_bytes = content_stream.encode("latin-1", errors="replace")
+        content_id = add_object(f"<< /Length {len(content_bytes)} >>\nstream\n".encode("latin-1") + content_bytes + b"\nendstream")
+        page_id = add_object(
+            f"<< /Type /Page /Parent {pages_placeholder_id} 0 R /MediaBox [0 0 612 792] "
+            f"/Resources << /Font << /F1 {font_id} 0 R >> >> /Contents {content_id} 0 R >>".encode("latin-1")
+        )
+        content_ids.append(content_id)
+        page_ids.append(page_id)
+
+    kids = " ".join(f"{page_id} 0 R" for page_id in page_ids)
+    objects[pages_placeholder_id - 1] = f"<< /Type /Pages /Count {len(page_ids)} /Kids [{kids}] >>".encode("latin-1")
+    objects[catalog_id - 1] = b"<< /Type /Catalog /Pages 2 0 R >>"
+
+    pdf = bytearray(b"%PDF-1.4\n%\xe2\xe3\xcf\xd3\n")
+    offsets = [0]
+    for index, obj in enumerate(objects, start=1):
+        offsets.append(len(pdf))
+        pdf.extend(f"{index} 0 obj\n".encode("latin-1"))
+        pdf.extend(obj)
+        pdf.extend(b"\nendobj\n")
+    xref_offset = len(pdf)
+    pdf.extend(f"xref\n0 {len(objects) + 1}\n".encode("latin-1"))
+    pdf.extend(b"0000000000 65535 f \n")
+    for offset in offsets[1:]:
+        pdf.extend(f"{offset:010d} 00000 n \n".encode("latin-1"))
+    pdf.extend(
+        (
+            f"trailer\n<< /Size {len(objects) + 1} /Root {catalog_id} 0 R >>\n"
+            f"startxref\n{xref_offset}\n%%EOF\n"
+        ).encode("latin-1")
+    )
+    return bytes(pdf)
+
+
+def _pdf_page_stream(lines: list[str]) -> str:
+    y = 752
+    stream_lines = []
+    for line in lines:
+        escaped = _pdf_escape(line)
+        stream_lines.extend(["BT", "/F1 11 Tf", f"1 0 0 1 36 {y} Tm", f"({escaped}) Tj", "ET"])
+        y -= 14
+    return "\n".join(stream_lines)
+
+
+def _pdf_escape(value: str) -> str:
+    return (
+        value.replace("\\", "\\\\")
+        .replace("(", "\\(")
+        .replace(")", "\\)")
+    )

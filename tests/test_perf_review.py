@@ -296,6 +296,7 @@ class PerfReviewTests(unittest.TestCase):
             try:
                 os.chdir(root)
                 self.assertEqual(0, main(["init"]))
+                self.assertTrue((root / "review_template.md").exists())
                 self.assertEqual(0, main(["source", "add", "git", "--path", str(repo), "--alias", "repo"]))
                 self.assertEqual(0, main(["source", "add", "jira", "--import-path", str(imports / "jira.json"), "--alias", "jira"]))
                 self.assertEqual(0, main(["source", "add", "confluence", "--import-path", str(docs_dir), "--alias", "docs"]))
@@ -316,12 +317,62 @@ class PerfReviewTests(unittest.TestCase):
             self.assertEqual(7, artifact_count)
             self.assertGreater(claim_count, 0)
             self_review = (root / ".perf_review" / "output" / "self_review.md").read_text(encoding="utf-8")
-            html_report = (root / ".perf_review" / "output" / "review_report.html").read_text(encoding="utf-8")
+            pdf_report = (root / ".perf_review" / "output" / "review_report.pdf").read_bytes()
             self.assertIn("Project summary:", self_review)
             self.assertIn("Total number of projects combined:", self_review)
             self.assertIn("[task:", self_review)
-            self.assertIn("<html", html_report)
+            self.assertTrue(pdf_report.startswith(b"%PDF-1.4"))
             db.close()
+
+    def test_run_command_uses_editable_review_template(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            repo = root / "repo"
+            imports = root / "imports"
+            imports.mkdir()
+            self._create_repo(repo)
+            (imports / "jira.json").write_text(
+                json.dumps(
+                    [
+                        {
+                            "key": "ABC-123",
+                            "fields": {
+                                "summary": "Build onboarding flow",
+                                "description": "Launch onboarding for new users",
+                                "updated": "2026-03-10T10:00:00Z",
+                                "created": "2026-03-05T10:00:00Z",
+                                "labels": ["launch"],
+                                "comment": {"comments": []},
+                            },
+                        }
+                    ]
+                ),
+                encoding="utf-8",
+            )
+            current = Path.cwd()
+            try:
+                os.chdir(root)
+                self.assertEqual(0, main(["init"]))
+                template_path = root / "review_template.md"
+                template_path.write_text(
+                    "# Performance Review Template\n\n"
+                    "Use this exact structure for each project:\n"
+                    "- Start with the project heading\n"
+                    "- Include a line starting with 'Outcome:'\n",
+                    encoding="utf-8",
+                )
+                config_manager = ConfigManager(root)
+                config = config_manager.load_config()
+                config["app"]["model"]["enabled"] = False
+                config_manager.save_config(config)
+                self.assertEqual(0, main(["source", "add", "git", "--path", str(repo)]))
+                self.assertEqual(0, main(["source", "add", "jira", "--import-path", str(imports / "jira.json"), "--alias", "jira"]))
+                self.assertEqual(0, main(["run", "--period", "2026-H1"]))
+            finally:
+                os.chdir(current)
+
+            self_review = (root / ".perf_review" / "output" / "self_review.md").read_text(encoding="utf-8")
+            self.assertIn("Project summary:", self_review)
 
     def test_git_only_repo_builds_multiple_tasks_not_single_repo_task(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
@@ -433,6 +484,83 @@ class PerfReviewTests(unittest.TestCase):
             self.assertEqual(["service-a", "service-b"], repo_names)
             db.close()
 
+    def test_related_issue_and_branch_clusters_consolidate_into_fewer_tasks(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            repo = root / "repo"
+            docs_dir = root / "docs"
+            docs_dir.mkdir()
+            self._create_auth_repo(repo)
+            (docs_dir / "auth.md").write_text(
+                "# Auth hardening\n\nABC-200, ABC-201, and ABC-202 are part of the same auth stabilization push across login, token refresh, and env validation.\n",
+                encoding="utf-8",
+            )
+            jira_import = root / "jira.json"
+            jira_import.write_text(
+                json.dumps(
+                    [
+                        {
+                            "key": "ABC-200",
+                            "fields": {
+                                "summary": "Add auth login/logout/status commands to CLI",
+                                "description": "Part of the auth stabilization push.",
+                                "updated": "2026-03-15T10:00:00Z",
+                                "created": "2026-03-12T10:00:00Z",
+                                "comment": {"comments": []},
+                            },
+                        },
+                        {
+                            "key": "ABC-201",
+                            "fields": {
+                                "summary": "Fix token refresh race in auth flows",
+                                "description": "Also part of the auth stabilization push.",
+                                "updated": "2026-03-16T10:00:00Z",
+                                "created": "2026-03-13T10:00:00Z",
+                                "comment": {"comments": []},
+                            },
+                        },
+                        {
+                            "key": "ABC-202",
+                            "fields": {
+                                "summary": "Add env validation for auth config",
+                                "description": "Completes the auth stabilization push.",
+                                "updated": "2026-03-17T10:00:00Z",
+                                "created": "2026-03-14T10:00:00Z",
+                                "comment": {"comments": []},
+                            },
+                        },
+                    ]
+                ),
+                encoding="utf-8",
+            )
+            current = Path.cwd()
+            try:
+                os.chdir(root)
+                self.assertEqual(0, main(["init"]))
+                self.assertEqual(0, main(["source", "add", "git", "--path", str(repo), "--alias", "repo"]))
+                self.assertEqual(0, main(["source", "add", "jira", "--import-path", str(jira_import), "--alias", "jira"]))
+                self.assertEqual(0, main(["source", "add", "confluence", "--import-path", str(docs_dir), "--alias", "docs"]))
+                self.assertEqual(0, main(["ingest"]))
+                self.assertEqual(0, main(["build", "--period", "2026-H1"]))
+            finally:
+                os.chdir(current)
+
+            db = Database(root / ".perf_review" / "perf_review.db")
+            task_count = db.connection.execute("select count(*) as count from tasks").fetchone()["count"]
+            self.assertLessEqual(task_count, 3)
+            auth_task = db.connection.execute(
+                """
+                select title, jira_keys_json, artifact_count
+                from tasks
+                order by artifact_count desc, title asc
+                limit 1
+                """
+            ).fetchone()
+            self.assertIn("ABC-200", json.loads(auth_task["jira_keys_json"]))
+            self.assertIn("ABC-201", json.loads(auth_task["jira_keys_json"]))
+            self.assertIn("ABC-202", json.loads(auth_task["jira_keys_json"]))
+            db.close()
+
     def test_keychain_secret_store_shells_out(self) -> None:
         store = MacOSKeychainSecretStore()
         with mock.patch("perf_review.utils.secrets.subprocess.run") as run_mock:
@@ -487,6 +615,25 @@ class PerfReviewTests(unittest.TestCase):
             target.write_text(previous + f"step {index}\n", encoding="utf-8")
             subprocess.run(["git", "add", "work.txt"], cwd=path, check=True, capture_output=True)
             subprocess.run(["git", "commit", "-m", message], cwd=path, check=True, capture_output=True)
+
+    def _create_auth_repo(self, path: Path) -> None:
+        path.mkdir(parents=True, exist_ok=True)
+        subprocess.run(["git", "init"], cwd=path, check=True, capture_output=True)
+        subprocess.run(["git", "config", "user.name", "Test User"], cwd=path, check=True, capture_output=True)
+        subprocess.run(["git", "config", "user.email", "test@example.com"], cwd=path, check=True, capture_output=True)
+        target = path / "auth.txt"
+        commits = [
+            "ABC-200 add auth login/logout/status commands",
+            "ABC-201 fix token refresh race condition",
+            "ABC-202 add env validation for auth config",
+            "ABC-201 add auth refresh concurrency test",
+        ]
+        for index, message in enumerate(commits, start=1):
+            previous = target.read_text(encoding="utf-8") if target.exists() else ""
+            target.write_text(previous + f"auth step {index}\n", encoding="utf-8")
+            subprocess.run(["git", "add", "auth.txt"], cwd=path, check=True, capture_output=True)
+            subprocess.run(["git", "commit", "-m", message], cwd=path, check=True, capture_output=True)
+        subprocess.run(["git", "checkout", "-b", "feat/ABC-202-env-validate"], cwd=path, check=True, capture_output=True)
 
 
 if __name__ == "__main__":

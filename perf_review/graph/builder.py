@@ -57,7 +57,12 @@ def rebuild_graph(database: Database, rubric: dict[str, Any]) -> None:
     rebuild_graph_with_enrichment(database, rubric, BaseLLMProvider())
 
 
-def rebuild_graph_with_enrichment(database: Database, rubric: dict[str, Any], llm_provider: BaseLLMProvider) -> None:
+def rebuild_graph_with_enrichment(
+    database: Database,
+    rubric: dict[str, Any],
+    llm_provider: BaseLLMProvider,
+    tasking_config: dict[str, Any] | None = None,
+) -> None:
     database.clear_graph()
     database.set_competencies(rubric.get("competencies", []))
     artifacts = [dict(row) for row in database.fetch_artifacts()]
@@ -105,6 +110,17 @@ def rebuild_graph_with_enrichment(database: Database, rubric: dict[str, Any], ll
     initial_clusters = _build_anchor_clusters(anchors)
     semantic_clusters = _build_semantic_clusters(orphan_artifacts)
     merged_clusters = _merge_clusters(initial_clusters + semantic_clusters, artifact_lookup)
+    merged_clusters = _consolidate_clusters(
+        merged_clusters,
+        artifact_lookup,
+        target_task_count=int((tasking_config or {}).get("target_task_count", 4)),
+        base_threshold=float((tasking_config or {}).get("consolidation_threshold", 0.82)),
+    )
+    merged_clusters = _absorb_supporting_clusters(
+        merged_clusters,
+        artifact_lookup,
+        target_task_count=int((tasking_config or {}).get("target_task_count", 4)),
+    )
 
     for cluster in merged_clusters:
         cluster_artifacts = [artifact for artifact in artifacts if artifact["id"] in cluster.artifact_ids]
@@ -302,6 +318,211 @@ def _merge_clusters(clusters: list[Cluster], artifact_lookup: dict[int, dict[str
             )
         )
     return merged
+
+
+def _consolidate_clusters(
+    clusters: list[Cluster],
+    artifact_lookup: dict[int, dict[str, Any]],
+    target_task_count: int,
+    base_threshold: float,
+) -> list[Cluster]:
+    if not clusters:
+        return clusters
+    consolidated = list(clusters)
+    while len(consolidated) > 1:
+        best_pair: tuple[int, int] | None = None
+        best_score = 0.0
+        for left_index in range(len(consolidated)):
+            for right_index in range(left_index + 1, len(consolidated)):
+                score = _consolidation_score(consolidated[left_index], consolidated[right_index], artifact_lookup)
+                if score > best_score:
+                    best_score = score
+                    best_pair = (left_index, right_index)
+        threshold = _dynamic_consolidation_threshold(len(consolidated), target_task_count, base_threshold)
+        if best_pair is None or best_score < threshold:
+            break
+        left_index, right_index = best_pair
+        merged = _merge_two_clusters(consolidated[left_index], consolidated[right_index], artifact_lookup)
+        consolidated[left_index] = merged
+        del consolidated[right_index]
+    return consolidated
+
+
+def _absorb_supporting_clusters(
+    clusters: list[Cluster],
+    artifact_lookup: dict[int, dict[str, Any]],
+    target_task_count: int,
+) -> list[Cluster]:
+    if len(clusters) <= max(1, target_task_count):
+        return clusters
+    consolidated = list(clusters)
+    while len(consolidated) > max(1, target_task_count):
+        best_pair: tuple[int, int] | None = None
+        best_score = 0.0
+        for source_index, source in enumerate(consolidated):
+            if not _is_supporting_cluster(source, artifact_lookup):
+                continue
+            for target_index, target in enumerate(consolidated):
+                if source_index == target_index or not _is_primary_cluster(target, artifact_lookup):
+                    continue
+                score = _supporting_cluster_score(source, target, artifact_lookup)
+                threshold = _supporting_cluster_threshold(source, artifact_lookup)
+                if score >= threshold and score > best_score:
+                    best_score = score
+                    best_pair = (source_index, target_index)
+        if best_pair is None:
+            break
+        source_index, target_index = best_pair
+        source = consolidated[source_index]
+        target = consolidated[target_index]
+        merged = _merge_two_clusters(target, source, artifact_lookup)
+        consolidated[target_index] = merged
+        del consolidated[source_index]
+    return consolidated
+
+
+def _dynamic_consolidation_threshold(cluster_count: int, target_task_count: int, base_threshold: float) -> float:
+    threshold = base_threshold
+    if target_task_count > 0 and cluster_count > target_task_count:
+        threshold -= min(0.18, 0.04 * (cluster_count - target_task_count))
+    return max(0.62, min(0.95, threshold))
+
+
+def _merge_two_clusters(left: Cluster, right: Cluster, artifact_lookup: dict[int, dict[str, Any]]) -> Cluster:
+    signature = _cluster_signature(left, artifact_lookup)
+    signature.update(_cluster_signature(right, artifact_lookup))
+    title_hint = left.title_hint or right.title_hint
+    reason = _combine_reasons(left.reason, right.reason)
+    if left.reason.startswith("anchor:issue:") and not right.reason.startswith("anchor:issue:"):
+        key = left.key
+    elif right.reason.startswith("anchor:issue:") and not left.reason.startswith("anchor:issue:"):
+        key = right.key
+    else:
+        key = left.key
+    return Cluster(
+        key=key,
+        artifact_ids=sorted(set(left.artifact_ids) | set(right.artifact_ids)),
+        reason=reason,
+        repo_names=tuple(sorted(set(left.repo_names) | set(right.repo_names))),
+        title_hint=title_hint,
+    )
+
+
+def _combine_reasons(left_reason: str, right_reason: str) -> str:
+    if left_reason == right_reason:
+        return left_reason
+    if left_reason.startswith("anchor:issue:") and right_reason.startswith("anchor:issue:"):
+        return "merged:initiative"
+    if left_reason.startswith("anchor:issue:"):
+        return f"merged:{left_reason}"
+    if right_reason.startswith("anchor:issue:"):
+        return f"merged:{right_reason}"
+    if left_reason.startswith("anchor") or right_reason.startswith("anchor"):
+        return "merged:anchor"
+    return "merged:semantic"
+
+
+def _consolidation_score(left: Cluster, right: Cluster, artifact_lookup: dict[int, dict[str, Any]]) -> float:
+    left_keys = set(_cluster_issue_keys(left, artifact_lookup))
+    right_keys = set(_cluster_issue_keys(right, artifact_lookup))
+    left_artifacts = [artifact_lookup[artifact_id] for artifact_id in left.artifact_ids if artifact_id in artifact_lookup]
+    right_artifacts = [artifact_lookup[artifact_id] for artifact_id in right.artifact_ids if artifact_id in artifact_lookup]
+    score = 0.0
+    shared_issue_keys = left_keys & right_keys
+    if shared_issue_keys:
+        score += 0.9
+    if left.reason.startswith("anchor:branch:") and shared_issue_keys:
+        score += 0.2
+    if right.reason.startswith("anchor:branch:") and shared_issue_keys:
+        score += 0.2
+    left_repos = set(left.repo_names)
+    right_repos = set(right.repo_names)
+    if left_repos & right_repos:
+        score += 0.18
+    if _clusters_time_related(left, right, artifact_lookup):
+        score += 0.08
+    score += _cosine(_cluster_signature(left, artifact_lookup), _cluster_signature(right, artifact_lookup)) * 0.45
+    if _all_issue_anchors(left, right):
+        score += 0.12
+    if _single_artifact_cluster(left) or _single_artifact_cluster(right):
+        score += 0.05
+    if left.reason.startswith("semantic:singleton") or right.reason.startswith("semantic:singleton"):
+        score += 0.05
+    if not shared_issue_keys and not (left_repos & right_repos):
+        score -= 0.18
+    return score
+
+
+def _cluster_issue_keys(cluster: Cluster, artifact_lookup: dict[int, dict[str, Any]]) -> list[str]:
+    issue_keys: set[str] = set()
+    for artifact_id in cluster.artifact_ids:
+        artifact = artifact_lookup.get(artifact_id)
+        if not artifact:
+            continue
+        metadata = _load_json(artifact["metadata_json"])
+        if metadata.get("issue_key"):
+            issue_keys.add(str(metadata["issue_key"]))
+        issue_keys.update(extract_issue_keys(f"{artifact['title']} {artifact['body_text']}"))
+        if artifact["artifact_type"] == "issue":
+            issue_keys.add(str(artifact["external_id"]))
+    return sorted(issue_keys)
+
+
+def _all_issue_anchors(left: Cluster, right: Cluster) -> bool:
+    left_issue = left.reason.startswith("anchor:issue:") or left.reason.startswith("merged:anchor:issue:")
+    right_issue = right.reason.startswith("anchor:issue:") or right.reason.startswith("merged:anchor:issue:")
+    return left_issue and right_issue
+
+
+def _single_artifact_cluster(cluster: Cluster) -> bool:
+    return len(cluster.artifact_ids) == 1
+
+
+def _cluster_artifact_types(cluster: Cluster, artifact_lookup: dict[int, dict[str, Any]]) -> set[str]:
+    return {
+        artifact_lookup[artifact_id]["artifact_type"]
+        for artifact_id in cluster.artifact_ids
+        if artifact_id in artifact_lookup
+    }
+
+
+def _is_supporting_cluster(cluster: Cluster, artifact_lookup: dict[int, dict[str, Any]]) -> bool:
+    issue_keys = _cluster_issue_keys(cluster, artifact_lookup)
+    artifact_types = _cluster_artifact_types(cluster, artifact_lookup)
+    if issue_keys:
+        return False
+    if cluster.reason.startswith("semantic"):
+        return True
+    return bool(artifact_types) and artifact_types == {"doc"}
+
+
+def _is_primary_cluster(cluster: Cluster, artifact_lookup: dict[int, dict[str, Any]]) -> bool:
+    if _cluster_issue_keys(cluster, artifact_lookup):
+        return True
+    if cluster.reason.startswith("anchor:issue:") or cluster.reason.startswith("merged:anchor"):
+        return True
+    return len(cluster.artifact_ids) >= 3
+
+
+def _supporting_cluster_score(source: Cluster, target: Cluster, artifact_lookup: dict[int, dict[str, Any]]) -> float:
+    score = _consolidation_score(source, target, artifact_lookup)
+    target_issue_keys = _cluster_issue_keys(target, artifact_lookup)
+    source_types = _cluster_artifact_types(source, artifact_lookup)
+    cosine = _cosine(_cluster_signature(source, artifact_lookup), _cluster_signature(target, artifact_lookup))
+    if target_issue_keys:
+        score += 0.08
+    if source_types == {"doc"} and cosine >= 0.08:
+        score += 0.12
+    if set(source.repo_names) & set(target.repo_names):
+        score += 0.05
+    return score
+
+
+def _supporting_cluster_threshold(source: Cluster, artifact_lookup: dict[int, dict[str, Any]]) -> float:
+    source_types = _cluster_artifact_types(source, artifact_lookup)
+    if source_types == {"doc"}:
+        return 0.22
+    return 0.44
 
 
 def _cluster_signature(cluster: Cluster, artifact_lookup: dict[int, dict[str, Any]]) -> Counter[str]:

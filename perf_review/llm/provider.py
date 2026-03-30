@@ -54,7 +54,14 @@ class BaseLLMProvider:
             lines.append("- Evidence coverage is balanced across configured competencies.")
         return "\n".join(lines)
 
-    def draft_portfolio_intro(self, subject_name: str, generated_on: str, total_projects: int, task_titles: list[str]) -> str:
+    def draft_portfolio_intro(
+        self,
+        subject_name: str,
+        generated_on: str,
+        total_projects: int,
+        task_titles: list[str],
+        template_instructions: str = "",
+    ) -> str:
         if task_titles:
             highlighted = ", ".join(task_titles[:3])
             return (
@@ -63,7 +70,7 @@ class BaseLLMProvider:
             )
         return f"Self assessment for {subject_name} - {generated_on}"
 
-    def draft_project_entry(self, project: dict[str, Any]) -> dict[str, Any]:
+    def draft_project_entry(self, project: dict[str, Any], template_instructions: str = "") -> dict[str, Any]:
         summary = project.get("summary") or project.get("description") or project["title"]
         implementation_summary = project.get("implementation_summary") or project.get("description") or summary
         impact_summary = project.get("impact_summary") or "Impact is inferred from the available implementation evidence."
@@ -84,6 +91,41 @@ class BaseLLMProvider:
             "code_contributions": code_contributions,
             "initiative_and_mentorship": collaboration_summary,
         }
+
+    def render_project_markdown(self, project: dict[str, Any], template_instructions: str = "") -> str:
+        draft = project["draft"]
+        lines = [f"## {project['title']}"]
+        if project.get("timeframe"):
+            lines.append(f"Timeframe: {project['timeframe']}")
+        if project.get("repos"):
+            lines.append(f"Repos involved: {', '.join(project['repos'])}")
+        lines.append("")
+        lines.append(f"Project summary: {draft['project_summary']}{project['citation']}")
+        lines.append("")
+        lines.append(f"Complexity & difficulty: {draft['complexity_and_difficulty']}")
+        lines.append("")
+        lines.append(f"My impact: {draft['my_impact']}")
+        lines.append("")
+        lines.append("My specific contributions:")
+        for item in draft["specific_contributions"] or ["Contribution details are inferred from the attached evidence."]:
+            lines.append(f"- {item}")
+        lines.append("")
+        lines.append("Technical leadership and code contributions:")
+        lines.append("")
+        lines.append(draft["technical_leadership"])
+        lines.append("")
+        lines.append("Design docs authored/reviewed:")
+        for item in draft["design_docs"] or ["No standalone design docs were attached to this task."]:
+            lines.append(f"- {item}")
+        lines.append("")
+        lines.append("Code & system contributions:")
+        for item in draft["code_contributions"] or ["Code and system contributions are represented in the attached evidence."]:
+            lines.append(f"- {item}")
+        lines.append("")
+        lines.append("Initiative & mentorship:")
+        lines.append("")
+        lines.append(draft["initiative_and_mentorship"])
+        return "\n".join(lines)
 
     def enrich_task(self, task_context: dict[str, Any]) -> dict[str, Any]:
         title = str(task_context.get("title") or "Task")
@@ -184,14 +226,22 @@ class OllamaProvider(BaseLLMProvider):
         except Exception:
             return super().draft_gaps(missing, weak)
 
-    def draft_portfolio_intro(self, subject_name: str, generated_on: str, total_projects: int, task_titles: list[str]) -> str:
+    def draft_portfolio_intro(
+        self,
+        subject_name: str,
+        generated_on: str,
+        total_projects: int,
+        task_titles: list[str],
+        template_instructions: str = "",
+    ) -> str:
         if not self.available():
-            return super().draft_portfolio_intro(subject_name, generated_on, total_projects, task_titles)
+            return super().draft_portfolio_intro(subject_name, generated_on, total_projects, task_titles, template_instructions)
         prompt = (
             "Write a concise 2-3 sentence header for a software engineer self assessment. "
             "Output plain text only. No preamble, no commentary, no 'here is', and no closing sentence. "
             "Keep the exact first line format 'Self assessment for <name> - <date>'. "
             "Then add one short summary sentence about the portfolio.\n"
+            f"Template instructions:\n{template_instructions or 'Use the default project-review structure.'}\n"
             f"Name: {subject_name}\n"
             f"Date: {generated_on}\n"
             f"Total projects: {total_projects}\n"
@@ -200,11 +250,11 @@ class OllamaProvider(BaseLLMProvider):
         try:
             return _clean_intro(self._generate(prompt), subject_name, generated_on, total_projects, task_titles)
         except Exception:
-            return super().draft_portfolio_intro(subject_name, generated_on, total_projects, task_titles)
+            return super().draft_portfolio_intro(subject_name, generated_on, total_projects, task_titles, template_instructions)
 
-    def draft_project_entry(self, project: dict[str, Any]) -> dict[str, Any]:
+    def draft_project_entry(self, project: dict[str, Any], template_instructions: str = "") -> dict[str, Any]:
         if not self.available():
-            return super().draft_project_entry(project)
+            return super().draft_project_entry(project, template_instructions)
         prompt = (
             "You are writing one project entry for a performance review self assessment. "
             "Return strict JSON with keys project_summary, complexity_and_difficulty, my_impact, "
@@ -212,6 +262,7 @@ class OllamaProvider(BaseLLMProvider):
             "specific_contributions, design_docs, and code_contributions must be arrays of short strings. "
             "Focus on concrete work and outcomes. Use the provided task rollup as the primary source of truth. "
             "Do not include chatty framing.\n"
+            f"Template instructions:\n{template_instructions or 'Use the default project-review structure.'}\n"
             f"Project: {json.dumps(project, indent=2)}"
         )
         try:
@@ -228,7 +279,27 @@ class OllamaProvider(BaseLLMProvider):
                 "initiative_and_mentorship": str(parsed.get("initiative_and_mentorship", project.get("collaboration_summary", ""))),
             }
         except Exception:
-            return super().draft_project_entry(project)
+            return super().draft_project_entry(project, template_instructions)
+
+    def render_project_markdown(self, project: dict[str, Any], template_instructions: str = "") -> str:
+        if not self.available() or not template_instructions.strip():
+            return super().render_project_markdown(project, template_instructions)
+        prompt = (
+            "Write one project section in markdown for a performance review. "
+            "Follow the user's template instructions as closely as possible. "
+            "Use the provided draft fields as the source of truth. "
+            "Preserve the exact citation string verbatim somewhere in the project summary line. "
+            "Do not add commentary outside the project section.\n"
+            f"Template instructions:\n{template_instructions}\n"
+            f"Project payload: {json.dumps(project, indent=2)}"
+        )
+        try:
+            rendered = self._generate(prompt).strip()
+            if rendered:
+                return rendered
+        except Exception:
+            pass
+        return super().render_project_markdown(project, template_instructions)
 
     def enrich_task(self, task_context: dict[str, Any]) -> dict[str, Any]:
         if not self.available():
@@ -363,4 +434,4 @@ def _clean_intro(raw: str, subject_name: str, generated_on: str, total_projects:
     ).strip()
     if cleaned.startswith("Self assessment for "):
         return cleaned
-    return BaseLLMProvider().draft_portfolio_intro(subject_name, generated_on, total_projects, task_titles)
+    return BaseLLMProvider().draft_portfolio_intro(subject_name, generated_on, total_projects, task_titles, "")

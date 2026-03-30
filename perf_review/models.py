@@ -67,6 +67,7 @@ class ReviewRunArtifacts:
     gaps_markdown: str
     report_html: str
     claims: list[ClaimRecord]
+    report_pdf: bytes = b""
 
 
 def utcnow_iso() -> str:
